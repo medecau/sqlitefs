@@ -6,8 +6,8 @@ sqlite-fs allows Linux and MacOS to mount a sqlite database file as a normal fil
 
 ## Requirements
 
-- Latest Rust Programming Language (≥ 1.38)
-- libfuse(Linux) or osxfuse(MacOS) is required by [fuse-rs](https://github.com/zargony/fuse-rs)
+- Latest Rust Programming Language (≥ 1.75)
+- libfuse3 (Linux) or macFUSE (macOS) is required by [fuser](https://github.com/cberner/fuser)
 
 ## Usage
 ### Mount a filesystem
@@ -51,6 +51,6 @@ Hello world!
 - [x] Copy/Move files
 - [x] Create Hard Link and Symbolic Link
 - [x] Read/Write extended attributes
-- [ ] File lock operations
+- [x] File lock operations (POSIX advisory locks; `F_SETLKW` returns `EAGAIN` — blocking locks unsupported in single-threaded FUSE)
 - [ ] Strict error handling
 

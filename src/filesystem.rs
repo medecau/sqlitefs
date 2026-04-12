@@ -8,6 +8,7 @@ use fuser::{
     ReplyWrite,
     ReplyCreate,
     ReplyEmpty,
+    ReplyLock,
     ReplyOpen,
     ReplyStatfs,
     ReplyXattr,
@@ -23,6 +24,9 @@ use fuser::{
 };
 use fuser::{Errno, FileHandle, Generation, INodeNo, LockOwner};
 use libc::{
+    F_RDLCK,
+    F_UNLCK,
+    F_WRLCK,
     O_APPEND,
     S_ISGID,
     S_ISVTX,
@@ -81,11 +85,21 @@ impl OpenDirHandler {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PosixLock {
+    owner: u64,  // LockOwner.0
+    pid: u32,    // returned in getlk replies
+    start: u64,  // inclusive start of byte range
+    end: u64,    // inclusive end; u64::MAX = to EOF
+    typ: i32,    // F_RDLCK or F_WRLCK
+}
+
 pub struct SqliteFs{
     db: Mutex<Sqlite>,
     lookup_count: Arc<Mutex<HashMap<u32, u32>>>,
     open_file_handler: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
     open_dir_handler: Arc<Mutex<HashMap<u32, OpenDirHandler>>>,
+    locks: Arc<Mutex<HashMap<u32, Vec<PosixLock>>>>,
 }
 
 impl SqliteFs {
@@ -95,15 +109,97 @@ impl SqliteFs {
         let lookup_count = Arc::new(Mutex::new(HashMap::<u32, u32>::new()));
         let open_file_handler = Arc::new(Mutex::new(HashMap::<u32, OpenFileHandler>::new()));
         let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
-        Ok(SqliteFs{db: Mutex::new(db), lookup_count, open_file_handler, open_dir_handler})
+        let locks = Arc::new(Mutex::new(HashMap::<u32, Vec<PosixLock>>::new()));
+        Ok(SqliteFs{db: Mutex::new(db), lookup_count, open_file_handler, open_dir_handler, locks})
     }
 
     pub fn new_with_db(db: Sqlite) -> Result<SqliteFs, Error> {
         let lookup_count = Arc::new(Mutex::new(HashMap::<u32, u32>::new()));
         let open_file_handler = Arc::new(Mutex::new(HashMap::<u32, OpenFileHandler>::new()));
         let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
-        Ok(SqliteFs{db: Mutex::new(db), lookup_count, open_file_handler, open_dir_handler})
+        let locks = Arc::new(Mutex::new(HashMap::<u32, Vec<PosixLock>>::new()));
+        Ok(SqliteFs{db: Mutex::new(db), lookup_count, open_file_handler, open_dir_handler, locks})
     }
+}
+
+fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+fn find_conflicting_lock(
+    locks: &[PosixLock],
+    owner: u64,
+    start: u64,
+    end: u64,
+    typ: i32,
+) -> Option<&PosixLock> {
+    if typ == F_UNLCK as i32 {
+        return None;
+    }
+    for lock in locks {
+        if lock.owner == owner {
+            continue;
+        }
+        if !ranges_overlap(lock.start, lock.end, start, end) {
+            continue;
+        }
+        if typ == F_RDLCK as i32 && lock.typ == F_RDLCK as i32 {
+            continue; // shared reads never conflict
+        }
+        return Some(lock);
+    }
+    None
+}
+
+fn apply_lock(locks: &mut Vec<PosixLock>, owner: u64, pid: u32, start: u64, end: u64, typ: i32) {
+    if start > end {
+        return;
+    }
+
+    // Step 1: Remove or trim the [start, end] range from all owned locks.
+    let old = std::mem::take(locks);
+    for lock in old {
+        if lock.owner != owner || !ranges_overlap(lock.start, lock.end, start, end) {
+            locks.push(lock);
+        } else {
+            if lock.start < start {
+                locks.push(PosixLock { end: start - 1, ..lock.clone() });
+            }
+            if lock.end > end {
+                locks.push(PosixLock { start: end + 1, ..lock });
+            }
+        }
+    }
+
+    if typ == F_UNLCK as i32 {
+        return;
+    }
+
+    // Step 2: Insert and coalesce adjacent/overlapping owned locks of the same type.
+    locks.push(PosixLock { owner, pid, start, end, typ });
+
+    let (mut same, other): (Vec<_>, Vec<_>) = std::mem::take(locks)
+        .into_iter()
+        .partition(|l| l.owner == owner && l.typ == typ);
+    same.sort_by_key(|l| l.start);
+
+    let mut merged: Vec<PosixLock> = Vec::new();
+    for lock in same {
+        if let Some(last) = merged.last_mut() {
+            let adjacent = last.end == u64::MAX || last.end + 1 >= lock.start;
+            if adjacent || ranges_overlap(last.start, last.end, lock.start, lock.end) {
+                last.end = last.end.max(lock.end);
+                continue;
+            }
+        }
+        merged.push(lock);
+    }
+    locks.extend(merged);
+    locks.extend(other);
+}
+
+fn remove_locks_for_owner(locks: &mut Vec<PosixLock>, owner: u64) {
+    locks.retain(|l| l.owner != owner);
 }
 
 impl Filesystem for SqliteFs {
@@ -800,5 +896,199 @@ impl Filesystem for SqliteFs {
         let lc = lc_list.entry(ino).or_insert(0);
         *lc += 1;
         reply.created(&ONE_SEC, &attr.get_file_attr(), Generation(0), FileHandle(0), FopenFlags::empty());
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let mut lock_table = self.locks.lock().unwrap();
+        let inode = ino.0 as u32;
+        if let Some(locks) = lock_table.get_mut(&inode) {
+            remove_locks_for_owner(locks, lock_owner.0);
+            if locks.is_empty() {
+                lock_table.remove(&inode);
+            }
+        }
+        reply.ok();
+    }
+
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        reply: ReplyLock,
+    ) {
+        let lock_table = self.locks.lock().unwrap();
+        let empty = Vec::new();
+        let locks = lock_table.get(&(ino.0 as u32)).unwrap_or(&empty);
+        match find_conflicting_lock(locks, lock_owner.0, start, end, typ) {
+            Some(c) => reply.locked(c.start, c.end, c.typ, c.pid),
+            None => reply.locked(0, 0, F_UNLCK as i32, 0),
+        }
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        _sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        if typ != F_RDLCK as i32 && typ != F_WRLCK as i32 && typ != F_UNLCK as i32 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let mut lock_table = self.locks.lock().unwrap();
+        let inode = ino.0 as u32;
+
+        if typ == F_UNLCK as i32 {
+            if let Some(locks) = lock_table.get_mut(&inode) {
+                apply_lock(locks, lock_owner.0, pid, start, end, typ);
+                if locks.is_empty() {
+                    lock_table.remove(&inode);
+                }
+            }
+            reply.ok();
+            return;
+        }
+
+        // Check for conflicts before acquiring.
+        {
+            let empty = Vec::new();
+            let locks = lock_table.get(&inode).unwrap_or(&empty);
+            if find_conflicting_lock(locks, lock_owner.0, start, end, typ).is_some() {
+                // Blocking (sleep=true / F_SETLKW) would deadlock a single-threaded FUSE
+                // daemon. Return EAGAIN and let the caller retry, matching sshfs behaviour.
+                reply.error(Errno::EAGAIN);
+                return;
+            }
+        }
+
+        let locks = lock_table.entry(inode).or_default();
+        apply_lock(locks, lock_owner.0, pid, start, end, typ);
+        reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    fn rdlk(owner: u64, start: u64, end: u64) -> PosixLock {
+        PosixLock { owner, pid: 1, start, end, typ: F_RDLCK as i32 }
+    }
+    fn wrlk(owner: u64, start: u64, end: u64) -> PosixLock {
+        PosixLock { owner, pid: 1, start, end, typ: F_WRLCK as i32 }
+    }
+
+    #[test]
+    fn test_ranges_overlap() {
+        assert!(ranges_overlap(0, 10, 5, 15));
+        assert!(ranges_overlap(5, 15, 0, 10));
+        assert!(ranges_overlap(0, 10, 10, 20));  // touching boundary
+        assert!(ranges_overlap(5, 10, 5, 10));   // identical
+        assert!(ranges_overlap(0, 20, 5, 10));   // containment
+        assert!(!ranges_overlap(0, 4, 5, 10));   // gap
+        assert!(!ranges_overlap(11, 20, 0, 10)); // gap other side
+    }
+
+    #[test]
+    fn test_no_conflict_same_owner() {
+        let locks = vec![wrlk(1, 0, 100)];
+        assert!(find_conflicting_lock(&locks, 1, 0, 100, F_WRLCK as i32).is_none());
+    }
+
+    #[test]
+    fn test_rdlck_rdlck_no_conflict() {
+        let locks = vec![rdlk(1, 0, 100)];
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK as i32).is_none());
+    }
+
+    #[test]
+    fn test_wrlck_blocks_rdlck() {
+        let locks = vec![wrlk(1, 0, 100)];
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK as i32).is_some());
+    }
+
+    #[test]
+    fn test_rdlck_blocks_wrlck() {
+        let locks = vec![rdlk(1, 0, 100)];
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_WRLCK as i32).is_some());
+    }
+
+    #[test]
+    fn test_no_conflict_non_overlapping_ranges() {
+        let locks = vec![wrlk(1, 0, 49)];
+        assert!(find_conflicting_lock(&locks, 2, 50, 100, F_WRLCK as i32).is_none());
+    }
+
+    #[test]
+    fn test_apply_lock_basic_acquire() {
+        let mut locks: Vec<PosixLock> = Vec::new();
+        apply_lock(&mut locks, 1, 100, 0, 99, F_WRLCK as i32);
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].start, 0);
+        assert_eq!(locks[0].end, 99);
+    }
+
+    #[test]
+    fn test_apply_lock_unlock_removes() {
+        let mut locks = vec![wrlk(1, 0, 100)];
+        apply_lock(&mut locks, 1, 100, 0, 100, F_UNLCK as i32);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn test_apply_lock_hole_punch() {
+        let mut locks = vec![wrlk(1, 0, 100)];
+        apply_lock(&mut locks, 1, 1, 30, 60, F_UNLCK as i32);
+        let mut owned: Vec<_> = locks.iter().filter(|l| l.owner == 1).collect();
+        owned.sort_by_key(|l| l.start);
+        assert_eq!(owned.len(), 2);
+        assert_eq!((owned[0].start, owned[0].end), (0, 29));
+        assert_eq!((owned[1].start, owned[1].end), (61, 100));
+    }
+
+    #[test]
+    fn test_apply_lock_coalesce_adjacent() {
+        let mut locks = vec![wrlk(1, 0, 49), wrlk(1, 51, 100)];
+        apply_lock(&mut locks, 1, 1, 50, 50, F_WRLCK as i32);
+        let owned: Vec<_> = locks.iter().filter(|l| l.owner == 1).collect();
+        assert_eq!(owned.len(), 1);
+        assert_eq!((owned[0].start, owned[0].end), (0, 100));
+    }
+
+    #[test]
+    fn test_apply_lock_does_not_affect_other_owners() {
+        let mut locks = vec![rdlk(2, 0, 100)];
+        apply_lock(&mut locks, 1, 1, 0, 100, F_WRLCK as i32);
+        assert_eq!(locks.len(), 2);
+        assert!(locks.iter().any(|l| l.owner == 2));
+        assert!(locks.iter().any(|l| l.owner == 1));
+    }
+
+    #[test]
+    fn test_remove_locks_for_owner() {
+        let mut locks = vec![wrlk(1, 0, 100), rdlk(2, 0, 100), wrlk(1, 200, 300)];
+        remove_locks_for_owner(&mut locks, 1);
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].owner, 2);
     }
 }
