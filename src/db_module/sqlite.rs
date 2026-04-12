@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use std::path::Path;
 use std::time::SystemTime;
 use chrono::{Utc, DateTime, NaiveDateTime, Timelike};
@@ -19,11 +19,13 @@ const DB_IFSOCK: u32 = 0o0_140_000;
 const BLOCK_SIZE: u32 = 4096;
 
 fn string_to_systemtime(text: String, nsec: u32) -> SystemTime {
-    let naive = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S")
-        .unwrap()
-        .with_nanosecond(nsec)
-        .unwrap();
-    SystemTime::from(naive.and_utc())
+    match NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
+        Ok(naive) => SystemTime::from(naive.with_nanosecond(nsec).unwrap_or(naive).and_utc()),
+        Err(err) => {
+            warn!("corrupt timestamp '{}': {} — using UNIX_EPOCH", text, err);
+            SystemTime::UNIX_EPOCH
+        }
+    }
 }
 
 fn file_type_to_const(kind: FileType) -> u32 {
@@ -47,7 +49,10 @@ fn const_to_file_type(kind: u32) -> FileType {
         DB_IFBLK => FileType::BlockDevice,
         DB_IFCHR => FileType::CharDevice,
         DB_IFIFO => FileType::NamedPipe,
-        _ => FileType::RegularFile,
+        other => {
+            warn!("unknown file type constant {} in database, treating as regular file", other);
+            FileType::RegularFile
+        }
     }
 }
 

@@ -1,4 +1,3 @@
-use log::error;
 use clap::{command, crate_version, Arg};
 use fuser::{Config, MountOption};
 use sqlite_fs::filesystem::SqliteFs;
@@ -51,26 +50,26 @@ fn main() {
         Some(path) => {
             match SqliteFs::new(path) {
                 Ok(n) => n,
-                Err(err) => {println!("{:?}", err); return;}
+                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
             }
         }
         None => {
             let mut db = match Sqlite::new_in_memory() {
                 Ok(n) => n,
-                Err(err) => {println!("{:?}", err); return;}
+                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
             };
             match db.init() {
                 Ok(n) => n,
-                Err(err) => {println!("{:?}", err); return;}
+                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
             };
             match SqliteFs::new_with_db(db) {
                 Ok(n) => n,
-                Err(err) => {println!("{:?}", err); return;}
+                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
             }
         }
     };
-    match fuser::mount2(fs, mountpoint, &config) {
-        Ok(n) => n,
-        Err(err) => error!("{}", err)
+    if let Err(err) = fuser::mount2(fs, mountpoint, &config) {
+        eprintln!("Mount failed: {}", err);
+        std::process::exit(1);
     }
 }

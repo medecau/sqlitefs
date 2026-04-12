@@ -56,4 +56,6 @@ The codebase has three layers:
 
 ## Error Handling
 
-Errors flow through `src/sqerror.rs`: `Error` variants (using `thiserror`) map to specific `libc` errno values in `filesystem.rs`. New filesystem error cases should add a variant to `Error` and match it in the relevant `filesystem.rs` handler.
+Errors flow through `src/sqerror.rs`: `Error` variants (using `thiserror`) carry their POSIX errno via `Error::to_errno()`. All filesystem handlers call `err.to_errno()` and log at `warn!` level — no per-handler errno mapping. To add a new error case: add a variant to `Error` and add a corresponding arm to `to_errno()`.
+
+Errors in fire-and-forget callbacks (`init`, `destroy`, `forget`) are logged at `warn!` but cannot be returned to the kernel. Non-UTF-8 filenames reply `EINVAL`. SQLite errors map to `EIO`.

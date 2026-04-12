@@ -52,5 +52,5 @@ Hello world!
 - [x] Create Hard Link and Symbolic Link
 - [x] Read/Write extended attributes
 - [x] File lock operations (POSIX advisory locks; `F_SETLKW` returns `EAGAIN` — blocking locks unsupported in single-threaded FUSE)
-- [ ] Strict error handling
+- [x] Strict error handling
 
