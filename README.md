@@ -51,6 +51,6 @@ Hello world!
 - [x] Copy/Move files
 - [x] Create Hard Link and Symbolic Link
 - [x] Read/Write extended attributes
-- [] File lock operations
-- [] Strict error handling
+- [ ] File lock operations
+- [ ] Strict error handling
 

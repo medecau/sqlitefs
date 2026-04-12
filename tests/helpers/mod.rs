@@ -1,8 +1,5 @@
 #![allow(dead_code)]
-extern crate tempfile;
-use nix::dir::Dir;
-use sqlite_fs::db_module::{sqlite, DbModule};
-use std::fs::File;
+use sqlite_fs::db_module::sqlite;
 use std::mem;
 
 enum DirOrNot {

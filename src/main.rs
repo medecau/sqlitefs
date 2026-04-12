@@ -1,13 +1,9 @@
-#[macro_use] extern crate failure;
-#[macro_use] extern crate log;
-#[macro_use] extern crate clap;
-use std::env;
-use std::ffi::OsStr;
+use log::error;
+use clap::{command, crate_version, Arg};
+use fuser::{Config, MountOption};
 use sqlite_fs::filesystem::SqliteFs;
-use clap::{Arg};
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::DbModule;
-use std::path::PathBuf;
 
 fn main() {
     env_logger::init();
@@ -36,27 +32,27 @@ fn main() {
         .arg(db_path_arg)
         .get_matches();
 
-    let mut option_vals = ["-o", "fsname=sqlitefs", "-o", "default_permissions", "-o", "allow_other"].to_vec();
+    let mut mount_options = vec![
+        MountOption::FSName("sqlitefs".to_string()),
+        MountOption::DefaultPermissions,
+        MountOption::CUSTOM("allow_other".to_string()),
+    ];
     if let Some(v) = matches.get_many::<String>("mount_option") {
         for i in v {
-            option_vals.push("-o");
-            option_vals.push(i);
+            mount_options.push(MountOption::CUSTOM(i.clone()));
         }
     }
+    let mut config = Config::default();
+    config.mount_options = mount_options;
 
     let mountpoint = matches.get_one::<String>("mount_point").expect("Mount point path is missing.");
     let db_path = matches.get_one::<String>("db_path");
-    let options = option_vals
-        .iter()
-        .map(|o| o.as_ref())
-        .collect::<Vec<&OsStr>>();
-    let fs: SqliteFs;
-    match db_path {
+    let fs: SqliteFs = match db_path {
         Some(path) => {
-            fs = match SqliteFs::new(path) {
+            match SqliteFs::new(path) {
                 Ok(n) => n,
                 Err(err) => {println!("{:?}", err); return;}
-            };
+            }
         }
         None => {
             let mut db = match Sqlite::new_in_memory() {
@@ -67,13 +63,13 @@ fn main() {
                 Ok(n) => n,
                 Err(err) => {println!("{:?}", err); return;}
             };
-            fs = match SqliteFs::new_with_db(db) {
+            match SqliteFs::new_with_db(db) {
                 Ok(n) => n,
                 Err(err) => {println!("{:?}", err); return;}
-            };
+            }
         }
-    }
-    match fuse::mount(fs, &mountpoint, &options) {
+    };
+    match fuser::mount2(fs, mountpoint, &config) {
         Ok(n) => n,
         Err(err) => error!("{}", err)
     }

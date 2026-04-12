@@ -7,20 +7,19 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-fuse = "0.3"
+fuser = "0.17"
 chrono = "0.4"
 libc = "0.2"
-failure = "0.1"
+thiserror = "2"
 log = "0.4"
-env_logger = "0.7"
-time = "0.1"
+env_logger = "0.11"
 
 [dependencies.clap]
 version = "4.5.26"
 features = ["cargo","color"]
 
 [dependencies.rusqlite]
-version = "0.20.0"
+version = "0.31"
 features = ["bundled", "blob"]
 
 [dependencies.nix]

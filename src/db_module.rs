@@ -1,9 +1,7 @@
 pub mod sqlite;
 use std::time::SystemTime;
 use crate::sqerror::Result;
-use fuse::{FileAttr, FileType};
-use time::Timespec;
-use chrono::{DateTime, Utc, NaiveDateTime};
+use fuser::{FileAttr, FileType, INodeNo};
 
 pub trait DbModule {
     /// Create tables (if not found) and add root directory (if not found)
@@ -57,8 +55,6 @@ pub trait DbModule {
     fn delete_xattr(&mut self, inode: u32, key: &str) -> Result<()>;
 }
 
-// Imported from rust-fuse 4.0-dev
-// This time format differs from v3.1
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct DBFileAttr {
     /// Inode number
@@ -92,35 +88,22 @@ pub struct DBFileAttr {
 }
 
 impl DBFileAttr {
-    fn timespec_from(&self, st: &SystemTime) -> Timespec {
-        if let Ok(dur_since_epoch) = st.duration_since(std::time::UNIX_EPOCH) {
-            Timespec::new(dur_since_epoch.as_secs() as i64,
-                          dur_since_epoch.subsec_nanos() as i32)
-        } else {
-            Timespec::new(0, 0)
-        }
-    }
-
-    pub fn datetime_from(&self, ts: &Timespec) -> SystemTime {
-        let dt = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(ts.sec, ts.nsec as u32), Utc);
-        SystemTime::from(dt)
-    }
-
     pub fn get_file_attr(&self) -> FileAttr {
         FileAttr {
-            ino: self.ino as u64,
+            ino: INodeNo(self.ino as u64),
             size: self.size as u64,
             blocks: self.blocks as u64,
-            atime: self.timespec_from(&self.atime),
-            mtime: self.timespec_from(&self.mtime),
-            ctime: self.timespec_from(&self.ctime),
-            crtime: self.timespec_from(&self.crtime),
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+            crtime: self.crtime,
             kind: self.kind,
             perm: self.perm,
             nlink: self.nlink,
             uid: self.uid,
             gid: self.gid,
             rdev: self.rdev,
+            blksize: 4096,
             flags: self.flags,
         }
     }

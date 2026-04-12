@@ -1,11 +1,12 @@
+use log::debug;
 use std::path::Path;
 use std::time::SystemTime;
 use chrono::{Utc, DateTime, NaiveDateTime, Timelike};
 use rusqlite::types::ToSql;
-use rusqlite::{params, Connection, NO_PARAMS, Statement};
+use rusqlite::{params, Connection, Statement};
 use crate::db_module::{DbModule, DBFileAttr, DEntry};
-use crate::sqerror::{Error, Result, ErrorKind};
-use fuse::FileType;
+use crate::sqerror::{Error, Result};
+use fuser::FileType;
 
 const DB_IFIFO: u32 = 0o0_010_000;
 const DB_IFCHR: u32 = 0o0_020_000;
@@ -18,9 +19,11 @@ const DB_IFSOCK: u32 = 0o0_140_000;
 const BLOCK_SIZE: u32 = 4096;
 
 fn string_to_systemtime(text: String, nsec: u32) -> SystemTime {
-    SystemTime::from(DateTime::<Utc>::from_utc(
-        NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S").unwrap().with_nanosecond(nsec).unwrap(), Utc
-    ))
+    let naive = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S")
+        .unwrap()
+        .with_nanosecond(nsec)
+        .unwrap();
+    SystemTime::from(naive.and_utc())
 }
 
 fn file_type_to_const(kind: FileType) -> u32 {
@@ -54,7 +57,7 @@ fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<()> {
         tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
     } else {
         let mut block = offset / BLOCK_SIZE;
-        if offset % BLOCK_SIZE != 0 {
+        if !offset.is_multiple_of(BLOCK_SIZE) {
             block = offset / BLOCK_SIZE + 1;
             let sql = "SELECT data FROM data WHERE file_id=$1 and block_num = $2";
             let mut stmt = tx.prepare(sql)?;
@@ -214,8 +217,7 @@ fn check_directory_is_empty_local(inode: u32, tx: &Connection) -> Result<bool> {
     let mut stmt = tx.prepare(sql)?;
     let rows = stmt.query_map(params![inode], |row| {
         Ok({
-            let name: String;
-            name = row.get(0)?;
+            let name: String = row.get(0)?;
             name
         })
     })?;
@@ -290,14 +292,14 @@ impl Sqlite {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
+        conn.execute("PRAGMA foreign_keys=ON", [])?;
         Ok(Sqlite { conn })
     }
 
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
+        conn.execute("PRAGMA foreign_keys=ON", [])?;
         Ok(Sqlite { conn })
     }
 }
@@ -469,10 +471,10 @@ impl DbModule for Sqlite {
         let oldattr = match oldattr {
             Some(n) => n,
             None => {
-                return Err(Error::from(ErrorKind::FsNoEnt {description: format!(
+                return Err(Error::FsNoEnt {description: format!(
                     "{} is not exist",
                     attr.ino
-                )}));
+                )});
             }
         };
         let now = Utc::now();
@@ -550,25 +552,25 @@ impl DbModule for Sqlite {
         let attr = match get_inode_local(inode, &tx)? {
             Some(n) => n,
             None => {
-                return Err(Error::from(ErrorKind::FsNoEnt {description: format!(
+                return Err(Error::FsNoEnt {description: format!(
                     "old path {} is not exist",
                     inode
-                )}));
+                )});
             }
         };
         if attr.kind != FileType::RegularFile {
-            return Err(Error::from(ErrorKind::FsParm {description: format!(
+            return Err(Error::FsParm {description: format!(
                 "old path {} is not a regular file",
                 inode
-            )}));
+            )});
         };
         let new_inode = get_dentry_single(parent, name, &tx)?;
         if new_inode.is_some() {
-            return Err(Error::from(ErrorKind::FsFileExist {description: format!(
+            return Err(Error::FsFileExist {description: format!(
                 "new path {}/{} exist",
                 parent,
                 name
-            )}));
+            )});
         }
         let entry = DEntry{
             parent_ino: parent,
@@ -609,7 +611,7 @@ impl DbModule for Sqlite {
         let dentry = match get_dentry_single(parent, name, &tx)? {
             Some(n) => n,
             None => {
-                return Err(Error::from(ErrorKind::FsNoEnt {description: format!("parent: {} name:{}", parent, name)}));
+                return Err(Error::FsNoEnt {description: format!("parent: {} name:{}", parent, name)});
             }
         };
         let mut res = None;
@@ -620,42 +622,42 @@ impl DbModule for Sqlite {
             if dentry.file_type != exist_file_type {
                 match exist_file_type {
                     FileType::Directory => {
-                        return Err(Error::from(ErrorKind::FsIsDir {
+                        return Err(Error::FsIsDir {
                             description: format!(
                                 "parent: {} name:{}",
                                 new_parent, new_name
                             )
-                        }));
+                        });
                     },
                     FileType::RegularFile => {
-                        return Err(Error::from(ErrorKind::FsIsNotDir {
+                        return Err(Error::FsIsNotDir {
                             description: format!(
                                 "parent: {} name:{}",
                                 new_parent,
                                 new_name
                             )
-                        }));
+                        });
                     },
                     _ => {
-                        return Err(Error::from(ErrorKind::Undefined {
+                        return Err(Error::Undefined {
                             description: format!(
                                 "parent: {} name:{} has invalid type: {:?}",
                                 new_parent,
                                 new_name,
                                 exist_file_type
                             )
-                        }));
+                        });
                     }
                 };
             }
             if exist_file_type ==FileType::Directory {
                 let empty = check_directory_is_empty_local(exist_id, &tx)?;
                 if !empty {
-                    return Err(Error::from(ErrorKind::FsNotEmpty {description: format!(
+                    return Err(Error::FsNotEmpty {description: format!(
                         "parent: {} name:{} is not empty",
                         new_parent,
                         new_name
-                    )}));
+                    )});
                 }
             }
             delete_dentry_local(new_parent, new_name, &tx)?;
@@ -801,12 +803,12 @@ impl DbModule for Sqlite {
             Ok(n) => n,
             Err(err) => {
                 if err == rusqlite::Error::QueryReturnedNoRows {
-                    return Err(Error::from(ErrorKind::FsNoEnt {
+                    return Err(Error::FsNoEnt {
                         description: format!(
                             "inode: {} name:{}",
                             inode, key
                         )
-                    }))
+                    })
                 } else {
                     return Err(Error::from(err))
                 }
@@ -819,7 +821,7 @@ impl DbModule for Sqlite {
         let sql = "SELECT name FROM xattr WHERE file_id=$1 ORDER BY name";
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![inode], |row| {
-            Ok(row.get(0)?)
+            row.get(0)
         })?;
         let mut name_list: Vec<String> = Vec::new();
         for row in rows {
