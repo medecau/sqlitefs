@@ -38,7 +38,7 @@ pub trait DbModule {
     fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
     /// Write data into a whole block.
     /// Update mtime and ctime.
-    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<()>;
+    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u64) -> Result<()>;
     /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inodes which nlink is 0.
@@ -60,7 +60,7 @@ pub struct DBFileAttr {
     /// Inode number
     pub ino: u32,
     /// Size in bytes
-    pub size: u32,
+    pub size: u64,
     /// block size
     pub blocks: u32,
     /// Time of last access
@@ -91,7 +91,7 @@ impl DBFileAttr {
     pub fn get_file_attr(&self) -> FileAttr {
         FileAttr {
             ino: INodeNo(self.ino as u64),
-            size: self.size as u64,
+            size: self.size,
             blocks: self.blocks as u64,
             atime: self.atime,
             mtime: self.mtime,

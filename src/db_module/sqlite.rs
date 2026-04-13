@@ -57,13 +57,13 @@ fn const_to_file_type(kind: u32) -> FileType {
 }
 
 /// Release all data in "inode", after "offset" byte.
-fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<()> {
+fn release_data(inode: u32, offset: u64, tx: &Connection) -> Result<()> {
     if offset == 0 {
         tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
     } else {
-        let mut block = offset / BLOCK_SIZE;
-        if !offset.is_multiple_of(BLOCK_SIZE) {
-            block = offset / BLOCK_SIZE + 1;
+        let mut block = (offset / BLOCK_SIZE as u64) as u32;
+        if !offset.is_multiple_of(BLOCK_SIZE as u64) {
+            block = (offset / BLOCK_SIZE as u64) as u32 + 1;
             let sql = "SELECT data FROM data WHERE file_id=$1 and block_num = $2";
             let mut stmt = tx.prepare(sql)?;
             let mut data: Vec<u8> = match stmt.query_row(params![inode, block], |row| row.get(0)) {
@@ -76,7 +76,7 @@ fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<()> {
                     }
                 }
             };
-            data.resize((offset % BLOCK_SIZE) as usize, 0);
+            data.resize((offset % BLOCK_SIZE as u64) as usize, 0);
             tx.execute("REPLACE INTO data \
             (file_id, block_num, data)
             VALUES($1, $2, $3)",
@@ -713,7 +713,7 @@ impl DbModule for Sqlite {
             ON metadata.id=dentry.child_id \
             AND dentry.parent_id=$1 \
             AND dentry.name=$2 \
-            LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data) AS blocknum \
+            LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data GROUP BY file_id) AS blocknum \
             ON dentry.child_id = blocknum.file_id \
             LEFT JOIN ( SELECT child_id, COUNT(child_id) nlink FROM dentry GROUP BY child_id) AS ncount \
             ON dentry.child_id = ncount.child_id \
@@ -750,10 +750,10 @@ impl DbModule for Sqlite {
         Ok(row)
     }
 
-    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<()> {
+    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u64) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let db_size: u32 = tx.query_row("SELECT size FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
+            let db_size: u64 = tx.query_row("SELECT size FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
             tx.execute("REPLACE INTO data \
             (file_id, block_num, data)
             VALUES($1, $2, $3)",
@@ -838,9 +838,14 @@ impl DbModule for Sqlite {
     fn delete_xattr(&mut self, inode: u32, key: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            tx.execute("DELETE FROM xattr \
+            let rows_deleted = tx.execute("DELETE FROM xattr \
             WHERE file_id = $1 AND name = $2",
                        params![inode, key])?;
+            if rows_deleted == 0 {
+                return Err(Error::FsNoEnt {
+                    description: format!("xattr inode:{} name:{}", inode, key),
+                });
+            }
         }
         let time = Utc::now();
         update_ctime(inode, time, &tx)?;
