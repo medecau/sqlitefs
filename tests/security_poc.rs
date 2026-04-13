@@ -2,9 +2,9 @@
 //! Tests are named poc_VNUM_short_description and are expected to FAIL
 //! until the corresponding fix is applied.
 
+use fuser::FileType;
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::{DBFileAttr, DbModule};
-use fuser::FileType;
 use std::time::SystemTime;
 
 mod helpers;
@@ -35,7 +35,8 @@ fn create_file(db: &mut Sqlite, name: &str) -> u32 {
         rdev: 0,
         flags: 0,
     };
-    db.add_inode_and_dentry(1, name, &attr).expect("create file")
+    db.add_inode_and_dentry(1, name, &attr)
+        .expect("create file")
 }
 
 /// Helper: create a symlink under root and return its inode number
@@ -57,9 +58,12 @@ fn create_symlink(db: &mut Sqlite, name: &str, target: &[u8]) -> u32 {
         rdev: 0,
         flags: 0,
     };
-    let ino = db.add_inode_and_dentry(1, name, &attr).expect("create symlink");
+    let ino = db
+        .add_inode_and_dentry(1, name, &attr)
+        .expect("create symlink");
     if !target.is_empty() {
-        db.write_data(ino, 1, target, target.len() as u64).expect("write symlink data");
+        db.write_data(ino, 1, target, target.len() as u64)
+            .expect("write symlink data");
     }
     ino
 }
@@ -84,7 +88,8 @@ fn create_dir(db: &mut Sqlite, parent: u32, name: &str) -> u32 {
         rdev: 0,
         flags: 0,
     };
-    db.add_inode_and_dentry(parent, name, &attr).expect("create dir")
+    db.add_inode_and_dentry(parent, name, &attr)
+        .expect("create dir")
 }
 
 // ============================================================================
@@ -159,7 +164,10 @@ fn poc_v02_offset_truncation_wraps_to_wrong_position() {
     let block_from_truncated = truncated as u64 / block_size + 1;
 
     // With the fix, the large-offset block is computed correctly
-    assert_eq!(block_from_large, 1048577, "V02: correct block for large offset");
+    assert_eq!(
+        block_from_large, 1048577,
+        "V02: correct block for large offset"
+    );
     // And it differs from the truncated (wrong) result
     assert_ne!(
         block_from_large, block_from_truncated,
@@ -228,17 +236,26 @@ fn poc_v04_nlookup_truncation_causes_wrong_decrement() {
     let nlookup: u64 = 0x1_0000_0003; // Formerly truncated to 3 when cast to u32
 
     // No truncation: nlookup stays as u64
-    assert_eq!(nlookup, 0x1_0000_0003, "V04: nlookup is full u64, not truncated to u32");
+    assert_eq!(
+        nlookup, 0x1_0000_0003,
+        "V04: nlookup is full u64, not truncated to u32"
+    );
 
     // saturating_sub prevents underflow
     let result = lc.saturating_sub(nlookup);
-    assert_eq!(result, 0, "V04: saturating_sub clamps to 0 instead of underflowing");
+    assert_eq!(
+        result, 0,
+        "V04: saturating_sub clamps to 0 instead of underflowing"
+    );
 
     // Smaller case: nlookup > lc also clamps to 0, not u64::MAX
     let lc_small: u64 = 1;
     let nlookup_bigger: u64 = 2;
     let result_small = lc_small.saturating_sub(nlookup_bigger);
-    assert_eq!(result_small, 0, "V04: saturating_sub prevents underflow when nlookup > lc");
+    assert_eq!(
+        result_small, 0,
+        "V04: saturating_sub prevents underflow when nlookup > lc"
+    );
 }
 
 // ============================================================================
@@ -305,7 +322,10 @@ fn poc_v06_symlink_orphan_on_oversized_target() {
 
     let oversized_target = vec![b'A'; 4097];
     let block_size = db.get_db_block_size() as usize;
-    assert!(oversized_target.len() > block_size, "target exceeds block size");
+    assert!(
+        oversized_target.len() > block_size,
+        "target exceeds block size"
+    );
 
     // After the fix: guard fires BEFORE add_inode_and_dentry —
     // if data.len() > 4096 { reply.error(ENAMETOOLONG); return; }
@@ -313,12 +333,24 @@ fn poc_v06_symlink_orphan_on_oversized_target() {
     if oversized_target.len() <= block_size {
         let now = SystemTime::now();
         let attr = DBFileAttr {
-            ino: 0, size: 0, blocks: 0,
-            atime: now, mtime: now, ctime: now, crtime: now,
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
             kind: FileType::Symlink,
-            perm: 0o777, nlink: 0, uid: 1000, gid: 1000, rdev: 0, flags: 0,
+            perm: 0o777,
+            nlink: 0,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            flags: 0,
         };
-        let _ino = db.add_inode_and_dentry(1, "orphan_link", &attr).expect("create");
+        let _ino = db
+            .add_inode_and_dentry(1, "orphan_link", &attr)
+            .expect("create");
     }
     // Guard fired: no inode was created for the oversized target.
     let orphan = db.lookup(1, "orphan_link").unwrap();

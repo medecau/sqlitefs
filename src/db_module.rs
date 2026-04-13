@@ -1,7 +1,7 @@
 pub mod sqlite;
-use std::time::SystemTime;
 use crate::sqerror::Result;
 use fuser::{FileAttr, FileType, INodeNo};
+use std::time::SystemTime;
 
 pub trait DbModule {
     /// Create tables (if not found) and add root directory (if not found)
@@ -26,7 +26,13 @@ pub trait DbModule {
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32>;
     /// Move dentry to another parent or name. Return inode number if a new file is overwrote.
     /// Update ctime, and mtime and ctime of the parent directories.
-    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<Option<u32>>;
+    fn move_dentry(
+        &mut self,
+        parent: u32,
+        name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> Result<Option<u32>>;
     /// check a directory if it is empty.
     fn check_directory_is_empty(&self, inode: u32) -> Result<bool>;
     /// lookup a directory entry table and get a file attribute.
@@ -38,7 +44,7 @@ pub trait DbModule {
     fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
     /// Write data into a whole block.
     /// Update mtime and ctime.
-    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u64) -> Result<()>;
+    fn write_data(&mut self, inode: u32, block: u32, data: &[u8], size: u64) -> Result<()>;
     /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inodes which nlink is 0.

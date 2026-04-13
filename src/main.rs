@@ -1,8 +1,8 @@
 use clap::{command, crate_version, Arg};
 use fuser::{Config, MountOption};
-use sqlite_fs::filesystem::SqliteFs;
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::DbModule;
+use sqlite_fs::filesystem::SqliteFs;
 
 fn main() {
     env_logger::init();
@@ -44,27 +44,39 @@ fn main() {
     let mut config = Config::default();
     config.mount_options = mount_options;
 
-    let mountpoint = matches.get_one::<String>("mount_point").expect("Mount point path is missing.");
+    let mountpoint = matches
+        .get_one::<String>("mount_point")
+        .expect("Mount point path is missing.");
     let db_path = matches.get_one::<String>("db_path");
     let fs: SqliteFs = match db_path {
-        Some(path) => {
-            match SqliteFs::new(path) {
-                Ok(n) => n,
-                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
+        Some(path) => match SqliteFs::new(path) {
+            Ok(n) => n,
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                std::process::exit(1);
             }
-        }
+        },
         None => {
             let mut db = match Sqlite::new_in_memory() {
                 Ok(n) => n,
-                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
             };
             match db.init() {
                 Ok(n) => n,
-                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
             };
             match SqliteFs::new_with_db(db) {
                 Ok(n) => n,
-                Err(err) => { eprintln!("Error: {}", err); std::process::exit(1); }
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
     };

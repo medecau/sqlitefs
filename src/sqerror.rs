@@ -32,13 +32,13 @@ impl Error {
     pub fn to_errno(&self) -> fuser::Errno {
         match self {
             Error::SqliteError { .. } => fuser::Errno::EIO,
-            Error::FsIsDir { .. }     => fuser::Errno::EISDIR,
-            Error::FsIsNotDir { .. }  => fuser::Errno::ENOTDIR,
-            Error::FsNoEnt { .. }     => fuser::Errno::ENOENT,
-            Error::FsNotEmpty { .. }  => fuser::Errno::ENOTEMPTY,
+            Error::FsIsDir { .. } => fuser::Errno::EISDIR,
+            Error::FsIsNotDir { .. } => fuser::Errno::ENOTDIR,
+            Error::FsNoEnt { .. } => fuser::Errno::ENOENT,
+            Error::FsNotEmpty { .. } => fuser::Errno::ENOTEMPTY,
             Error::FsFileExist { .. } => fuser::Errno::EEXIST,
-            Error::FsParm { .. }      => fuser::Errno::EPERM,
-            Error::Undefined { .. }   => fuser::Errno::EIO,
+            Error::FsParm { .. } => fuser::Errno::EPERM,
+            Error::Undefined { .. } => fuser::Errno::EIO,
         }
     }
 }
