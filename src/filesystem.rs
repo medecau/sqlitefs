@@ -4,7 +4,7 @@ use fuser::{
     ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use fuser::{Errno, FileHandle, Generation, INodeNo, LockOwner};
-use libc::{F_RDLCK, F_UNLCK, F_WRLCK, O_APPEND, XATTR_CREATE, XATTR_REPLACE};
+use libc::{O_APPEND, XATTR_CREATE, XATTR_REPLACE};
 
 #[cfg(not(target_os = "macos"))]
 use libc::O_NOATIME;
@@ -14,6 +14,16 @@ use libc::O_NOATIME;
 // defining them here avoids cross-platform cast warnings.
 const S_ISGID: u16 = 0o2000;
 const S_ISVTX: u16 = 0o1000;
+
+// POSIX advisory-lock type constants, typed as i32 to match the lock-type fields
+// throughout this module. libc::F_RDLCK/F_WRLCK/F_UNLCK are i16 on macOS and
+// i32 on Linux; the allow suppresses the redundant-cast warning on Linux only.
+#[allow(clippy::unnecessary_cast)]
+const F_RDLCK: i32 = libc::F_RDLCK as i32;
+#[allow(clippy::unnecessary_cast)]
+const F_WRLCK: i32 = libc::F_WRLCK as i32;
+#[allow(clippy::unnecessary_cast)]
+const F_UNLCK: i32 = libc::F_UNLCK as i32;
 
 use crate::db_module::sqlite::Sqlite;
 use crate::db_module::{DBFileAttr, DEntry, DbModule};
@@ -133,7 +143,7 @@ fn find_conflicting_lock(
     end: u64,
     typ: i32,
 ) -> Option<&PosixLock> {
-    if typ == F_UNLCK as i32 {
+    if typ == F_UNLCK {
         return None;
     }
     for lock in locks {
@@ -143,7 +153,7 @@ fn find_conflicting_lock(
         if !ranges_overlap(lock.start, lock.end, start, end) {
             continue;
         }
-        if typ == F_RDLCK as i32 && lock.typ == F_RDLCK as i32 {
+        if typ == F_RDLCK && lock.typ == F_RDLCK {
             continue; // shared reads never conflict
         }
         return Some(lock);
@@ -177,7 +187,7 @@ fn apply_lock(locks: &mut Vec<PosixLock>, owner: u64, pid: u32, start: u64, end:
         }
     }
 
-    if typ == F_UNLCK as i32 {
+    if typ == F_UNLCK {
         return;
     }
 
@@ -1342,7 +1352,7 @@ impl Filesystem for SqliteFs {
         let locks = lock_table.get(&(ino.0 as u32)).unwrap_or(&empty);
         match find_conflicting_lock(locks, lock_owner.0, start, end, typ) {
             Some(c) => reply.locked(c.start, c.end, c.typ, c.pid),
-            None => reply.locked(0, 0, F_UNLCK as i32, 0),
+            None => reply.locked(0, 0, F_UNLCK, 0),
         }
     }
 
@@ -1359,14 +1369,14 @@ impl Filesystem for SqliteFs {
         _sleep: bool,
         reply: ReplyEmpty,
     ) {
-        if typ != F_RDLCK as i32 && typ != F_WRLCK as i32 && typ != F_UNLCK as i32 {
+        if typ != F_RDLCK && typ != F_WRLCK && typ != F_UNLCK {
             reply.error(Errno::EINVAL);
             return;
         }
         let mut lock_table = self.locks.lock().unwrap();
         let inode = ino.0 as u32;
 
-        if typ == F_UNLCK as i32 {
+        if typ == F_UNLCK {
             if let Some(locks) = lock_table.get_mut(&inode) {
                 apply_lock(locks, lock_owner.0, pid, start, end, typ);
                 if locks.is_empty() {
@@ -1405,7 +1415,7 @@ mod lock_tests {
             pid: 1,
             start,
             end,
-            typ: F_RDLCK as i32,
+            typ: F_RDLCK,
         }
     }
     fn wrlk(owner: u64, start: u64, end: u64) -> PosixLock {
@@ -1414,7 +1424,7 @@ mod lock_tests {
             pid: 1,
             start,
             end,
-            typ: F_WRLCK as i32,
+            typ: F_WRLCK,
         }
     }
 
@@ -1432,37 +1442,37 @@ mod lock_tests {
     #[test]
     fn test_no_conflict_same_owner() {
         let locks = vec![wrlk(1, 0, 100)];
-        assert!(find_conflicting_lock(&locks, 1, 0, 100, F_WRLCK as i32).is_none());
+        assert!(find_conflicting_lock(&locks, 1, 0, 100, F_WRLCK).is_none());
     }
 
     #[test]
     fn test_rdlck_rdlck_no_conflict() {
         let locks = vec![rdlk(1, 0, 100)];
-        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK as i32).is_none());
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK).is_none());
     }
 
     #[test]
     fn test_wrlck_blocks_rdlck() {
         let locks = vec![wrlk(1, 0, 100)];
-        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK as i32).is_some());
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_RDLCK).is_some());
     }
 
     #[test]
     fn test_rdlck_blocks_wrlck() {
         let locks = vec![rdlk(1, 0, 100)];
-        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_WRLCK as i32).is_some());
+        assert!(find_conflicting_lock(&locks, 2, 0, 100, F_WRLCK).is_some());
     }
 
     #[test]
     fn test_no_conflict_non_overlapping_ranges() {
         let locks = vec![wrlk(1, 0, 49)];
-        assert!(find_conflicting_lock(&locks, 2, 50, 100, F_WRLCK as i32).is_none());
+        assert!(find_conflicting_lock(&locks, 2, 50, 100, F_WRLCK).is_none());
     }
 
     #[test]
     fn test_apply_lock_basic_acquire() {
         let mut locks: Vec<PosixLock> = Vec::new();
-        apply_lock(&mut locks, 1, 100, 0, 99, F_WRLCK as i32);
+        apply_lock(&mut locks, 1, 100, 0, 99, F_WRLCK);
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].start, 0);
         assert_eq!(locks[0].end, 99);
@@ -1471,14 +1481,14 @@ mod lock_tests {
     #[test]
     fn test_apply_lock_unlock_removes() {
         let mut locks = vec![wrlk(1, 0, 100)];
-        apply_lock(&mut locks, 1, 100, 0, 100, F_UNLCK as i32);
+        apply_lock(&mut locks, 1, 100, 0, 100, F_UNLCK);
         assert!(locks.is_empty());
     }
 
     #[test]
     fn test_apply_lock_hole_punch() {
         let mut locks = vec![wrlk(1, 0, 100)];
-        apply_lock(&mut locks, 1, 1, 30, 60, F_UNLCK as i32);
+        apply_lock(&mut locks, 1, 1, 30, 60, F_UNLCK);
         let mut owned: Vec<_> = locks.iter().filter(|l| l.owner == 1).collect();
         owned.sort_by_key(|l| l.start);
         assert_eq!(owned.len(), 2);
@@ -1489,7 +1499,7 @@ mod lock_tests {
     #[test]
     fn test_apply_lock_coalesce_adjacent() {
         let mut locks = vec![wrlk(1, 0, 49), wrlk(1, 51, 100)];
-        apply_lock(&mut locks, 1, 1, 50, 50, F_WRLCK as i32);
+        apply_lock(&mut locks, 1, 1, 50, 50, F_WRLCK);
         let owned: Vec<_> = locks.iter().filter(|l| l.owner == 1).collect();
         assert_eq!(owned.len(), 1);
         assert_eq!((owned[0].start, owned[0].end), (0, 100));
@@ -1498,7 +1508,7 @@ mod lock_tests {
     #[test]
     fn test_apply_lock_does_not_affect_other_owners() {
         let mut locks = vec![rdlk(2, 0, 100)];
-        apply_lock(&mut locks, 1, 1, 0, 100, F_WRLCK as i32);
+        apply_lock(&mut locks, 1, 1, 0, 100, F_WRLCK);
         assert_eq!(locks.len(), 2);
         assert!(locks.iter().any(|l| l.owner == 2));
         assert!(locks.iter().any(|l| l.owner == 1));

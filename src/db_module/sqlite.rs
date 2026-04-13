@@ -622,7 +622,11 @@ impl DbModule for Sqlite {
         update_mtime(parent, now, &tx)?;
         update_ctime(parent, now, &tx)?;
         tx.commit()?;
-        Ok(attr)
+        // Re-fetch after commit so nlink reflects the new dentry count.
+        // get_inode_local computes nlink via COUNT(child_id) in dentry, so it
+        // must run after the transaction that adds the hard-link dentry is committed.
+        let fresh_attr = get_inode_local(inode, &self.conn)?.unwrap_or(attr);
+        Ok(fresh_attr)
     }
 
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32> {
