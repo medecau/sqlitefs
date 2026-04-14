@@ -135,7 +135,7 @@ if ln -s "$LONG_TARGET" "$MNT/bad-sym" 2>/dev/null; then
 else
     echo "  ok   V06 oversized symlink rejected"
 fi
-check "V06 no orphan dentry" "0" "$(ls "$MNT" 2>/dev/null | grep -c bad-sym || echo 0)"
+check "V06 no orphan dentry" "0" "$(ls "$MNT" 2>/dev/null | grep -c bad-sym || true)"
 
 # V08: lookup block count — write 3 blocks, verify per-file count (GROUP BY fix).
 # sqlitefs reports blocks in native 4096-byte units without converting to the POSIX
