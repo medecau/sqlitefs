@@ -40,10 +40,13 @@ mkdir -p "$MNT"
 # --- 1. Start sqlite-fs and wait for mount ---
 "$BINARY" "$MNT" &
 FS_PID=$!
+# Order matters: unmount BEFORE kill so the kernel unwinds the FUSE
+# connection cleanly. Killing first leaves stuck mounts and dentries.
 trap 'unmount_fs "$MNT"; kill $FS_PID 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 50); do
     is_mounted "$MNT" && break
+    kill -0 "$FS_PID" 2>/dev/null || { echo "FAIL: $BINARY exited during startup"; exit 1; }
     sleep 0.1
 done
 is_mounted "$MNT" || { echo "FAIL: mount never became live"; exit 1; }
@@ -135,6 +138,8 @@ if ln -s "$LONG_TARGET" "$MNT/bad-sym" 2>/dev/null; then
 else
     echo "  ok   V06 oversized symlink rejected"
 fi
+# grep -c writes "0" to stdout AND exits 1 on zero matches; || true keeps
+# the count visible to the substitution while satisfying set -e.
 check "V06 no orphan dentry" "0" "$(ls "$MNT" 2>/dev/null | grep -c bad-sym || true)"
 
 # V08: lookup block count — write 3 blocks, verify per-file count (GROUP BY fix).
@@ -162,7 +167,7 @@ fi
 # V12: mv -n (no-clobber) must not overwrite an existing destination
 echo original > "$MNT/dest"
 echo newdata  > "$MNT/src"
-mv -n "$MNT/src" "$MNT/dest" 2>/dev/null || true
+mv -n "$MNT/src" "$MNT/dest"
 check "V12 noreplace preserves dest" "original" "$(cat "$MNT/dest")"
 rm -f "$MNT/src" "$MNT/dest"
 

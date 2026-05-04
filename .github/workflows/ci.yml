@@ -9,13 +9,14 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -28,23 +29,25 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libfuse3-dev pkg-config fuse3 attr
           # src/main.rs hardcodes allow_other; non-root users need this in fuse.conf
-          echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+          grep -qxF user_allow_other /etc/fuse.conf \
+            || echo user_allow_other | sudo tee -a /etc/fuse.conf
 
       - name: Install macFUSE (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install --cask macfuse
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
           # The macFUSE kext cannot load on GitHub's hosted runners (requires
           # System Settings → Privacy & Security approval), but its headers,
-          # libfuse dylibs, and fuse.pc are installed at /usr/local/ regardless,
-          # which is all `cargo build` needs. The e2e smoke test is skipped on
+          # libfuse dylibs, and fuse.pc install under $(brew --prefix), which
+          # is what `cargo build` needs. The e2e smoke test is skipped on
           # macOS because a live mount requires the kext to be loaded.
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build
 
       - name: Unit and integration tests
-        run: cargo test --verbose
+        run: cargo test
 
       - name: End-to-end smoke test
         if: runner.os == 'Linux'
@@ -53,9 +56,10 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
