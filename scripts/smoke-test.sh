@@ -164,10 +164,14 @@ else
     echo "  skip V11 (setfattr not available on this OS)"
 fi
 
-# V12: mv -n (no-clobber) must not overwrite an existing destination
+# V12: mv -n (no-clobber) must not overwrite an existing destination.
+# GNU coreutils 9.0+ changed `mv -n` to print "mv: not replacing …" to
+# stderr AND exit 1 when the destination exists (Ubuntu 24.04 runners
+# ship coreutils 9.4). Suppress both — the V12 invariant we care about
+# is "destination unchanged", asserted by the next line.
 echo original > "$MNT/dest"
 echo newdata  > "$MNT/src"
-mv -n "$MNT/src" "$MNT/dest"
+mv -n "$MNT/src" "$MNT/dest" 2>/dev/null || true
 check "V12 noreplace preserves dest" "original" "$(cat "$MNT/dest")"
 rm -f "$MNT/src" "$MNT/dest"
 
