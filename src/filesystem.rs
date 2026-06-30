@@ -46,7 +46,7 @@ struct OpenFileStat {
 }
 
 struct OpenFileHandler {
-    count: u64,
+    next_fh: u64,
     list: HashMap<u64, OpenFileStat>,
 }
 
@@ -63,21 +63,21 @@ impl OpenFileStat {
 impl OpenFileHandler {
     fn new() -> Self {
         Self {
-            count: 0,
+            next_fh: 0,
             list: HashMap::<u64, OpenFileStat>::new(),
         }
     }
 }
 
 struct OpenDirHandler {
-    count: u64,
+    next_fh: u64,
     list: HashMap<u64, Vec<DEntry>>,
 }
 
 impl OpenDirHandler {
     fn new() -> Self {
         Self {
-            count: 0,
+            next_fh: 0,
             list: HashMap::<u64, Vec<DEntry>>::new(),
         }
     }
@@ -778,9 +778,9 @@ impl Filesystem for SqliteFs {
         }
         let mut handler = self.open_file_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
-        let fh = handle_list.count;
+        let fh = handle_list.next_fh;
         handle_list.list.insert(fh, stat);
-        handle_list.count += 1;
+        handle_list.next_fh += 1;
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
@@ -925,8 +925,7 @@ impl Filesystem for SqliteFs {
         let mut handler = self.open_file_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
         handle_list.list.remove(&fh);
-        handle_list.count = handle_list.count.saturating_sub(1);
-        if handle_list.count == 0 {
+        if handle_list.list.is_empty() {
             handler.remove(&ino);
         }
         reply.ok();
@@ -946,9 +945,9 @@ impl Filesystem for SqliteFs {
         drop(db);
         let mut handler = self.open_dir_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenDirHandler::new);
-        let fh = handle_list.count;
+        let fh = handle_list.next_fh;
         handle_list.list.insert(fh, dentries);
-        handle_list.count += 1;
+        handle_list.next_fh += 1;
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
@@ -1050,8 +1049,7 @@ impl Filesystem for SqliteFs {
         let mut handler = self.open_dir_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenDirHandler::new);
         handle_list.list.remove(&fh);
-        handle_list.count = handle_list.count.saturating_sub(1);
-        if handle_list.count == 0 {
+        if handle_list.list.is_empty() {
             handler.remove(&ino);
         }
         reply.ok();
@@ -1303,9 +1301,9 @@ impl Filesystem for SqliteFs {
         drop(lc_list);
         let mut handler = self.open_file_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
-        let fh = handle_list.count;
+        let fh = handle_list.next_fh;
         handle_list.list.insert(fh, OpenFileStat::new());
-        handle_list.count += 1;
+        handle_list.next_fh += 1;
         drop(handler);
         reply.created(
             &ONE_SEC,

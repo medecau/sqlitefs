@@ -600,9 +600,9 @@ impl DbModule for Sqlite {
                 });
             }
         };
-        if attr.kind != FileType::RegularFile {
+        if attr.kind == FileType::Directory {
             return Err(Error::FsParm {
-                description: format!("old path {} is not a regular file", inode),
+                description: format!("hardlink to directory {} is not permitted", inode),
             });
         };
         let new_inode = get_dentry_single(parent, name, &tx)?;
@@ -614,7 +614,7 @@ impl DbModule for Sqlite {
         let entry = DEntry {
             parent_ino: parent,
             child_ino: inode,
-            file_type: FileType::RegularFile,
+            file_type: attr.kind,
             filename: name.to_string(),
         };
         add_dentry(entry, &tx)?;
@@ -670,27 +670,17 @@ impl DbModule for Sqlite {
         if let Some(v) = exist_entry {
             let exist_id = v.child_ino;
             let exist_file_type = v.file_type;
-            if dentry.file_type != exist_file_type {
-                match exist_file_type {
-                    FileType::Directory => {
-                        return Err(Error::FsIsDir {
-                            description: format!("parent: {} name:{}", new_parent, new_name),
-                        });
-                    }
-                    FileType::RegularFile => {
-                        return Err(Error::FsIsNotDir {
-                            description: format!("parent: {} name:{}", new_parent, new_name),
-                        });
-                    }
-                    _ => {
-                        return Err(Error::Undefined {
-                            description: format!(
-                                "parent: {} name:{} has invalid type: {:?}",
-                                new_parent, new_name, exist_file_type
-                            ),
-                        });
-                    }
-                };
+            let src_is_dir = dentry.file_type == FileType::Directory;
+            let dst_is_dir = exist_file_type == FileType::Directory;
+            if src_is_dir && !dst_is_dir {
+                return Err(Error::FsIsNotDir {
+                    description: format!("parent: {} name:{}", new_parent, new_name),
+                });
+            }
+            if !src_is_dir && dst_is_dir {
+                return Err(Error::FsIsDir {
+                    description: format!("parent: {} name:{}", new_parent, new_name),
+                });
             }
             if exist_file_type == FileType::Directory {
                 let empty = check_directory_is_empty_local(exist_id, &tx)?;
@@ -702,6 +692,7 @@ impl DbModule for Sqlite {
                         ),
                     });
                 }
+                delete_sub_dentry(exist_id, &tx)?;
             }
             delete_dentry_local(new_parent, new_name, &tx)?;
             res = Some(v.child_ino);

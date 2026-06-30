@@ -766,6 +766,138 @@ fn poc_v18_null_kind_in_schema_produces_wrong_file_type() {
 }
 
 // ============================================================================
+// V20: CRITICAL — link_dentry rejects symlinks/FIFOs/devices (POSIX violation)
+// ============================================================================
+
+/// POSIX only forbids hardlinks to directories. Symlinks, FIFOs, sockets,
+/// and device nodes are all valid hardlink sources.
+#[test]
+fn poc_v20_link_to_symlink_rejected() {
+    let mut db = fresh_db();
+    let src_ino = create_symlink(&mut db, "orig_link", b"/tmp/somewhere");
+
+    let result = db.link_dentry(src_ino, 1, "second_link");
+
+    assert!(
+        result.is_ok(),
+        "V20: link_dentry to a symlink should succeed (POSIX allows hardlinks to \
+         anything except directories); got {:?}",
+        result.err()
+    );
+}
+
+// ============================================================================
+// V21: CRITICAL — move_dentry returns EIO for cross-type rename (POSIX violation)
+// ============================================================================
+
+/// POSIX: rename(src, dst) replaces dst whenever neither side is a directory.
+/// The old code returned Err(Undefined) → EIO for any non-{Dir,RegularFile}
+/// type pair, making `mv regularfile symlink` fail with a baffling EIO.
+#[test]
+fn poc_v21_rename_regular_over_symlink_fails() {
+    let mut db = fresh_db();
+    let _file_ino = create_file(&mut db, "real");
+    let _link_ino = create_symlink(&mut db, "alias", b"/etc/hostname");
+
+    let result = db.move_dentry(1, "real", 1, "alias");
+
+    assert!(
+        result.is_ok(),
+        "V21: rename(regular, symlink) should replace the symlink; got {:?}",
+        result.err()
+    );
+}
+
+// ============================================================================
+// V22: CRITICAL — move_dentry dir-overwrite leaks victim's self-referential dentries
+// ============================================================================
+
+/// When move_dentry overwrites an empty directory, the victim's "." and ".."
+/// entries survive. delete_inode_if_noref then counts nlink=1 (the surviving ".")
+/// and refuses to delete the metadata row — permanent orphan accumulation.
+#[test]
+fn poc_v22_rename_dir_over_dir_leaks_orphan() {
+    let mut db = fresh_db();
+    let _src = create_dir(&mut db, 1, "newdir");
+    let dst_ino = create_dir(&mut db, 1, "olddir");
+
+    db.move_dentry(1, "newdir", 1, "olddir")
+        .expect("rename dir over empty dir should succeed");
+
+    // Simulate the FUSE-layer post-rename cleanup that filesystem.rs performs
+    // when the kernel's lookup_count has dropped to zero for this inode.
+    db.delete_inode_if_noref(dst_ino).expect("cleanup");
+
+    let inode = db.get_inode(dst_ino).expect("get_inode");
+    assert!(
+        inode.is_none(),
+        "V22: overwritten directory inode {} should be deleted, not orphaned",
+        dst_ino
+    );
+}
+
+// ============================================================================
+// V23: CRITICAL — open-release-open cycle produces colliding handle IDs
+// ============================================================================
+
+/// `count` was simultaneously the next-fh generator AND the open-handle
+/// refcount. After open(fh=0), open(fh=1), release(fh=0) the refcount drops
+/// back to 1, so the next open returns fh=1 — colliding with the still-open
+/// handle. The fix separates these concerns: next_fh is monotonic; emptiness
+/// of the per-inode list determines when the handler entry is removed.
+#[test]
+fn poc_v23_handle_id_reuse_after_release() {
+    use std::collections::HashMap;
+
+    struct Handler {
+        next_fh: u64,
+        list: HashMap<u64, ()>,
+    }
+    let mut handlers: HashMap<u32, Handler> = HashMap::new();
+    let ino: u32 = 7;
+
+    // open #1
+    let h = handlers
+        .entry(ino)
+        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let fh1 = h.next_fh;
+    h.list.insert(fh1, ());
+    h.next_fh += 1;
+
+    // open #2
+    let h = handlers
+        .entry(ino)
+        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let fh2 = h.next_fh;
+    h.list.insert(fh2, ());
+    h.next_fh += 1;
+
+    // release #1
+    let h = handlers
+        .entry(ino)
+        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    h.list.remove(&fh1);
+    if h.list.is_empty() {
+        handlers.remove(&ino);
+    }
+
+    // open #3 — must not collide with still-open fh2
+    let h = handlers
+        .entry(ino)
+        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let fh3 = h.next_fh;
+    h.list.insert(fh3, ());
+    h.next_fh += 1;
+
+    assert_ne!(
+        fh3, fh2,
+        "V23: open after release must not reuse a still-open handle ID \
+         (fh2={}, fh3={})",
+        fh2, fh3
+    );
+}
+
+// ============================================================================
 // V19: Bonus — write_data size tracking only updates when growing
 // ============================================================================
 
