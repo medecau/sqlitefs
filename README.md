@@ -21,6 +21,10 @@ If a database file doesn't exist, sqlite-fs create db file and tables.
 If a database file name isn't specified, sqlite-fs use in-memory-db instead of a file.
 All data will be deleted when the filesystem is closed.
 
+A file-backed database runs in SQLite's WAL mode: while mounted, `<db_path>-wal` and
+`<db_path>-shm` sit next to it. Unmount before copying the database, or copy all three files.
+Databases created by older versions are migrated to integer timestamps on first mount.
+
 ### Unmount a filesystem
 
 - Linux

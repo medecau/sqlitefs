@@ -62,7 +62,7 @@ fn create_symlink(db: &mut Sqlite, name: &str, target: &[u8]) -> u32 {
         .add_inode_and_dentry(1, name, &attr)
         .expect("create symlink");
     if !target.is_empty() {
-        db.write_data(ino, 1, target, target.len() as u64)
+        db.write_data(ino, &[(1, target)], target.len() as u64)
             .expect("write symlink data");
     }
     ino
@@ -106,7 +106,7 @@ fn poc_v01_size_field_is_u32_cannot_hold_large_files() {
     let mut db = fresh_db();
     let ino = create_file(&mut db, "bigfile");
     let data = vec![0xAA; 4096];
-    db.write_data(ino, 1, &data, 4096).unwrap();
+    db.write_data(ino, &[(1, &data)], 4096).unwrap();
 
     let mut attr = db.get_inode(ino).unwrap().unwrap();
     attr.size = large_size; // u64 — no truncation
@@ -128,7 +128,7 @@ fn poc_v01_setattr_truncates_large_size_via_db() {
 
     // Write some data so the file exists
     let data = vec![0xAA; 4096];
-    db.write_data(ino, 1, &data, 4096).unwrap();
+    db.write_data(ino, &[(1, &data)], 4096).unwrap();
 
     // After the fix: DBFileAttr.size is u64, no truncation occurs
     let mut attr = db.get_inode(ino).unwrap().unwrap();
@@ -406,13 +406,15 @@ fn poc_v08_lookup_block_count_wrong_without_group_by() {
     // Write 3 blocks to file_a
     for i in 1..=3 {
         let data = vec![0xAA; 4096];
-        db.write_data(ino_a, i, &data, i as u64 * 4096).unwrap();
+        db.write_data(ino_a, &[(i, &data)], i as u64 * 4096)
+            .unwrap();
     }
 
     // Write 2 blocks to file_b
     for i in 1..=2 {
         let data = vec![0xBB; 4096];
-        db.write_data(ino_b, i, &data, i as u64 * 4096).unwrap();
+        db.write_data(ino_b, &[(i, &data)], i as u64 * 4096)
+            .unwrap();
     }
 
     // Now lookup file_a — the block count should be 3
@@ -432,47 +434,21 @@ fn poc_v08_lookup_block_count_wrong_without_group_by() {
 // V09: HIGH — multi-block write not atomic
 // ============================================================================
 
-/// Each block write in a multi-block write() is a separate transaction.
-/// This test proves it by writing across 3 blocks and verifying each
-/// block's transaction is independent.
+/// Fixed: write() hands all blocks of one request to a single write_data call,
+/// which stores every block, the size, and the times in one transaction.
 #[test]
-fn poc_v09_multi_block_writes_are_separate_transactions() {
+fn poc_v09_multi_block_write_is_one_transaction() {
     let mut db = fresh_db();
     let ino = create_file(&mut db, "multiblock");
 
-    // Write block 1 and verify it's committed
     let data1 = vec![0x11; 4096];
-    db.write_data(ino, 1, &data1, 4096).unwrap();
-
-    // Write block 2 in a separate call
     let data2 = vec![0x22; 4096];
-    db.write_data(ino, 2, &data2, 8192).unwrap();
+    db.write_data(ino, &[(1, &data1), (2, &data2)], 8192)
+        .unwrap();
 
-    // If we read block 1 now, it exists independently of block 2.
-    // In an atomic write, either both blocks are written or neither.
-    let block1 = db.get_data(ino, 1, 4096).unwrap();
-    assert_eq!(block1, data1);
-
-    // The vulnerability is that each write_data is a separate transaction.
-    // If a crash occurred between block 1 and block 2, we'd have partial data.
-    // We can prove non-atomicity by checking the size after each write.
-    let _attr_after_1 = db.get_inode(ino).unwrap().unwrap();
-
-    let ino2 = create_file(&mut db, "multiblock2");
-    db.write_data(ino2, 1, &data1, 4096).unwrap();
-    let attr_mid = db.get_inode(ino2).unwrap().unwrap();
-
-    // After writing only 1 of 3 blocks, size is already updated.
-    // This means a partial write is visible in the metadata — non-atomic.
-    // In an atomic system, size would only update after all blocks succeed.
-    assert_eq!(
-        attr_mid.size, 4096,
-        "V09: size is updated per-block, not per-write — partial writes leave inconsistent state"
-    );
-
-    // This test documents the vulnerability. A true fix would wrap the entire
-    // multi-block write in a single transaction. This test always passes because
-    // the non-atomicity is the current behavior.
+    assert_eq!(db.get_data(ino, 1, 4096).unwrap(), data1);
+    assert_eq!(db.get_data(ino, 2, 4096).unwrap(), data2);
+    assert_eq!(db.get_inode(ino).unwrap().unwrap().size, 8192);
 }
 
 // ============================================================================
@@ -687,7 +663,7 @@ fn poc_v16_release_data_block_overflow_at_u32_edge() {
 
     // Write block 1
     let data = vec![0xFF; 4096];
-    db.write_data(ino, 1, &data, 4096).unwrap();
+    db.write_data(ino, &[(1, &data)], 4096).unwrap();
 
     // Truncate to 0 should delete all data
     let mut attr = db.get_inode(ino).unwrap().unwrap();
@@ -707,9 +683,9 @@ fn poc_v16_release_data_block_overflow_at_u32_edge() {
 // V17: MEDIUM — corrupt timestamp falls back silently
 // ============================================================================
 
-/// string_to_systemtime returns UNIX_EPOCH for corrupt timestamps.
-/// This is by design after the error handling fix, but if an attacker
-/// can inject bad timestamps into the DB, all file times become epoch.
+/// Timestamps are now integer nanoseconds, so there is no text to corrupt.
+/// Unparseable text in a legacy database becomes UNIX_EPOCH when init()
+/// migrates it (covered by tests/sqlite.rs legacy_text_timestamps_are_migrated).
 #[test]
 fn poc_v17_corrupt_timestamp_in_db_silently_resets_to_epoch() {
     let mut db = fresh_db();
@@ -725,10 +701,6 @@ fn poc_v17_corrupt_timestamp_in_db_silently_resets_to_epoch() {
         "freshly created file should have recent mtime, but it's {} seconds old",
         age.as_secs()
     );
-
-    // This test documents that corrupt timestamps silently degrade.
-    // The fix (UNIX_EPOCH fallback) prevents panics but loses time info.
-    // A stronger fix would validate timestamps on write and reject bad ones.
 }
 
 // ============================================================================
@@ -857,34 +829,38 @@ fn poc_v23_handle_id_reuse_after_release() {
     let ino: u32 = 7;
 
     // open #1
-    let h = handlers
-        .entry(ino)
-        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let h = handlers.entry(ino).or_insert(Handler {
+        next_fh: 0,
+        list: HashMap::new(),
+    });
     let fh1 = h.next_fh;
     h.list.insert(fh1, ());
     h.next_fh += 1;
 
     // open #2
-    let h = handlers
-        .entry(ino)
-        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let h = handlers.entry(ino).or_insert(Handler {
+        next_fh: 0,
+        list: HashMap::new(),
+    });
     let fh2 = h.next_fh;
     h.list.insert(fh2, ());
     h.next_fh += 1;
 
     // release #1
-    let h = handlers
-        .entry(ino)
-        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let h = handlers.entry(ino).or_insert(Handler {
+        next_fh: 0,
+        list: HashMap::new(),
+    });
     h.list.remove(&fh1);
     if h.list.is_empty() {
         handlers.remove(&ino);
     }
 
     // open #3 — must not collide with still-open fh2
-    let h = handlers
-        .entry(ino)
-        .or_insert(Handler { next_fh: 0, list: HashMap::new() });
+    let h = handlers.entry(ino).or_insert(Handler {
+        next_fh: 0,
+        list: HashMap::new(),
+    });
     let fh3 = h.next_fh;
     h.list.insert(fh3, ());
     h.next_fh += 1;
@@ -911,14 +887,14 @@ fn poc_v19_write_data_never_shrinks_size() {
 
     // Write 8192 bytes (blocks 1 and 2)
     let data = vec![0xAA; 4096];
-    db.write_data(ino, 1, &data, 4096).unwrap();
-    db.write_data(ino, 2, &data, 8192).unwrap();
+    db.write_data(ino, &[(1, &data)], 4096).unwrap();
+    db.write_data(ino, &[(2, &data)], 8192).unwrap();
 
     let attr = db.get_inode(ino).unwrap().unwrap();
     assert_eq!(attr.size, 8192, "file should be 8192 bytes");
 
     // Now overwrite block 1 with size=4096 (a smaller total)
-    db.write_data(ino, 1, &data, 4096).unwrap();
+    db.write_data(ino, &[(1, &data)], 4096).unwrap();
 
     // Size should still be 8192 because write_data only grows, never shrinks.
     let attr2 = db.get_inode(ino).unwrap().unwrap();

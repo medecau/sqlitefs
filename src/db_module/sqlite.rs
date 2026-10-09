@@ -1,12 +1,11 @@
 use crate::db_module::{DBFileAttr, DEntry, DbModule};
 use crate::sqerror::{Error, Result};
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use fuser::FileType;
 use log::{debug, warn};
 use rusqlite::types::ToSql;
-use rusqlite::{params, Connection, Statement};
+use rusqlite::{params, Connection, OptionalExtension, Statement};
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DB_IFIFO: u32 = 0o0_010_000;
 const DB_IFCHR: u32 = 0o0_020_000;
@@ -18,15 +17,47 @@ const DB_IFSOCK: u32 = 0o0_140_000;
 
 const BLOCK_SIZE: u32 = 4096;
 
-fn string_to_systemtime(text: String, nsec: u32) -> SystemTime {
-    match NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
-        Ok(naive) => SystemTime::from(naive.with_nanosecond(nsec).unwrap_or(naive).and_utc()),
-        Err(err) => {
-            warn!("corrupt timestamp '{}': {} — using UNIX_EPOCH", text, err);
-            SystemTime::UNIX_EPOCH
-        }
+/// Timestamps are stored as i64 nanoseconds since the Unix epoch. Times outside
+/// that range (before 1677 or after 2262) saturate instead of failing.
+fn to_ns(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_nanos()).map_or(i64::MIN, |n| -n),
     }
 }
+
+fn from_ns(ns: i64) -> SystemTime {
+    if ns >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
+    }
+}
+
+fn now_ns() -> i64 {
+    to_ns(SystemTime::now())
+}
+
+/// Databases created before integer timestamps stored text plus a separate
+/// nanosecond column; convert them in place. Unparseable text becomes the epoch.
+const MIGRATE_TEXT_TIMESTAMPS: &str = "
+    ALTER TABLE metadata ADD COLUMN atime_ns int not null default 0;
+    ALTER TABLE metadata ADD COLUMN mtime_ns int not null default 0;
+    ALTER TABLE metadata ADD COLUMN ctime_ns int not null default 0;
+    ALTER TABLE metadata ADD COLUMN crtime_ns int not null default 0;
+    UPDATE metadata SET
+        atime_ns = coalesce(unixepoch(atime), 0) * 1000000000 + coalesce(atime_nsec, 0),
+        mtime_ns = coalesce(unixepoch(mtime), 0) * 1000000000 + coalesce(mtime_nsec, 0),
+        ctime_ns = coalesce(unixepoch(ctime), 0) * 1000000000 + coalesce(ctime_nsec, 0),
+        crtime_ns = coalesce(unixepoch(crtime), 0) * 1000000000 + coalesce(crtime_nsec, 0);
+    ALTER TABLE metadata DROP COLUMN atime;
+    ALTER TABLE metadata DROP COLUMN atime_nsec;
+    ALTER TABLE metadata DROP COLUMN mtime;
+    ALTER TABLE metadata DROP COLUMN mtime_nsec;
+    ALTER TABLE metadata DROP COLUMN ctime;
+    ALTER TABLE metadata DROP COLUMN ctime_nsec;
+    ALTER TABLE metadata DROP COLUMN crtime;
+    ALTER TABLE metadata DROP COLUMN crtime_nsec;";
 
 fn file_type_to_const(kind: FileType) -> u32 {
     match kind {
@@ -95,30 +126,20 @@ fn release_data(inode: u32, offset: u64, tx: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn update_time(inode: u32, sql: &str, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
-    let mut stmt = tx.prepare(sql)?;
-    let params = params![
-        &time.format("%Y-%m-%d %H:%M:%S").to_string(),
-        time.timestamp_subsec_nanos(),
-        inode
-    ];
-    stmt.execute(params)?;
+fn update_mtime(inode: u32, ns: i64, tx: &Connection) -> Result<()> {
+    tx.execute(
+        "UPDATE metadata SET mtime_ns=$1 WHERE id=$2",
+        params![ns, inode],
+    )?;
     Ok(())
 }
 
-fn update_atime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
-    let sql = "UPDATE metadata SET atime=datetime($1), atime_nsec=$2 WHERE id=$3";
-    update_time(inode, sql, time, tx)
-}
-
-fn update_mtime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
-    let sql = "UPDATE metadata SET mtime=datetime($1), mtime_nsec=$2 WHERE id=$3";
-    update_time(inode, sql, time, tx)
-}
-
-fn update_ctime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
-    let sql = "UPDATE metadata SET ctime=datetime($1), ctime_nsec=$2 WHERE id=$3";
-    update_time(inode, sql, time, tx)
+fn update_ctime(inode: u32, ns: i64, tx: &Connection) -> Result<()> {
+    tx.execute(
+        "UPDATE metadata SET ctime_ns=$1 WHERE id=$2",
+        params![ns, inode],
+    )?;
+    Ok(())
 }
 
 fn add_dentry(entry: DEntry, tx: &Connection) -> Result<()> {
@@ -140,18 +161,18 @@ fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFil
         Ok(DBFileAttr {
             ino: row.get(0)?,
             size: row.get(1)?,
-            blocks: row.get(17).unwrap_or(0),
-            atime: string_to_systemtime(row.get(2)?, row.get(3)?),
-            mtime: string_to_systemtime(row.get(4)?, row.get(5)?),
-            ctime: string_to_systemtime(row.get(6)?, row.get(7)?),
-            crtime: string_to_systemtime(row.get(8)?, row.get(9)?),
-            kind: const_to_file_type(row.get(10)?),
-            perm: row.get(11)?,
-            nlink: row.get(12)?,
-            uid: row.get(13)?,
-            gid: row.get(14)?,
-            rdev: row.get(15)?,
-            flags: row.get(16)?,
+            atime: from_ns(row.get(2)?),
+            mtime: from_ns(row.get(3)?),
+            ctime: from_ns(row.get(4)?),
+            crtime: from_ns(row.get(5)?),
+            kind: const_to_file_type(row.get(6)?),
+            perm: row.get(7)?,
+            nlink: row.get(8)?,
+            uid: row.get(9)?,
+            gid: row.get(10)?,
+            rdev: row.get(11)?,
+            flags: row.get(12)?,
+            blocks: row.get(13)?,
         })
     })?;
     let mut attrs = Vec::new();
@@ -166,29 +187,13 @@ fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFil
 }
 
 fn get_inode_local(inode: u32, tx: &Connection) -> Result<Option<DBFileAttr>> {
-    let sql = "SELECT \
-            metadata.id,\
-            metadata.size,\
-            metadata.atime,\
-            metadata.atime_nsec,\
-            metadata.mtime,\
-            metadata.mtime_nsec,\
-            metadata.ctime,\
-            metadata.ctime_nsec,\
-            metadata.crtime,\
-            metadata.crtime_nsec,\
-            metadata.kind, \
-            metadata.mode,\
-            ncount.nlink,\
-            metadata.uid,\
-            metadata.gid,\
-            metadata.rdev,\
-            metadata.flags,\
-            blocknum.block_num \
-            FROM metadata \
-            LEFT JOIN (SELECT count(block_num) block_num FROM data WHERE file_id=$1) AS blocknum \
-            LEFT JOIN ( SELECT COUNT(child_id) nlink FROM dentry WHERE child_id=$1 GROUP BY child_id) AS ncount \
-            WHERE id=$1";
+    // Scalar subqueries always yield a count (0, never NULL), so an unlinked but
+    // still-open inode reports nlink 0; dentry_child_id keeps the count indexed.
+    let sql = "SELECT id, size, atime_ns, mtime_ns, ctime_ns, crtime_ns, kind, mode, \
+            (SELECT count(*) FROM dentry WHERE child_id = metadata.id), \
+            uid, gid, rdev, flags, \
+            (SELECT count(*) FROM data WHERE file_id = metadata.id) \
+            FROM metadata WHERE id=$1";
     let stmt = tx.prepare(sql)?;
     let params = params![inode];
     parse_attr(stmt, params)
@@ -249,41 +254,17 @@ fn check_directory_is_empty_local(inode: u32, tx: &Connection) -> Result<bool> {
 
 fn add_inode_local(attr: &DBFileAttr, tx: &Connection) -> Result<u32> {
     let sql = "INSERT INTO metadata \
-            (size,\
-            atime,\
-            atime_nsec,\
-            mtime,\
-            mtime_nsec,\
-            ctime,\
-            ctime_nsec,\
-            crtime,\
-            crtime_nsec,\
-            kind, \
-            mode,\
-            nlink,\
-            uid,\
-            gid,\
-            rdev,\
-            flags\
-            ) \
-            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)";
-    let atime = DateTime::<Utc>::from(attr.atime);
-    let mtime = DateTime::<Utc>::from(attr.mtime);
-    let ctime = DateTime::<Utc>::from(attr.ctime);
-    let crtime = DateTime::<Utc>::from(attr.crtime);
+            (size, atime_ns, mtime_ns, ctime_ns, crtime_ns, kind, mode, nlink, uid, gid, rdev, flags) \
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
     {
         tx.execute(
             sql,
             params![
                 attr.size,
-                atime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                atime.timestamp_subsec_nanos(),
-                mtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                mtime.timestamp_subsec_nanos(),
-                ctime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                ctime.timestamp_subsec_nanos(),
-                crtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                crtime.timestamp_subsec_nanos(),
+                to_ns(attr.atime),
+                to_ns(attr.mtime),
+                to_ns(attr.ctime),
+                to_ns(attr.crtime),
                 file_type_to_const(attr.kind),
                 attr.perm,
                 0,
@@ -311,7 +292,11 @@ impl Sqlite {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", [])?;
+        // WAL + synchronous=NORMAL: commits skip the fsync, which is deferred to
+        // checkpoints; fsync()/fsyncdir() force one via DbModule::checkpoint.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )?;
         Ok(Sqlite { conn })
     }
 
@@ -335,14 +320,10 @@ impl DbModule for Sqlite {
                 let sql = "CREATE TABLE metadata(\
                     id integer primary key autoincrement,\
                     size int default 0 not null,\
-                    atime text,\
-                    atime_nsec int,\
-                    mtime text,\
-                    mtime_nsec int,\
-                    ctime text,\
-                    ctime_nsec int,\
-                    crtime text,\
-                    crtime_nsec int,\
+                    atime_ns int not null default 0,\
+                    mtime_ns int not null default 0,\
+                    ctime_ns int not null default 0,\
+                    crtime_ns int not null default 0,\
                     kind int,\
                     mode int,\
                     nlink int default 0 not null,\
@@ -353,6 +334,16 @@ impl DbModule for Sqlite {
                     )";
                 let res = self.conn.execute(sql, params![])?;
                 debug!("metadata table: {}", res);
+            }
+            let legacy: u32 = self.conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('metadata') WHERE name = 'atime_nsec'",
+                [],
+                |row| row.get(0),
+            )?;
+            if legacy > 0 {
+                let tx = self.conn.transaction()?;
+                tx.execute_batch(MIGRATE_TEXT_TIMESTAMPS)?;
+                tx.commit()?;
             }
         }
         {
@@ -371,6 +362,11 @@ impl DbModule for Sqlite {
                     )";
                 self.conn.execute(sql, params![])?;
             }
+            // nlink is COUNT(*) over child_id; also serves the FK cascade check.
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS dentry_child_id ON dentry(child_id)",
+                [],
+            )?;
         }
         {
             let row_count: u32 = self
@@ -485,7 +481,7 @@ impl DbModule for Sqlite {
             };
             add_dentry(dentry, &tx)?;
         }
-        let now = Utc::now();
+        let now = now_ns();
         update_mtime(parent, now, &tx)?;
         update_ctime(parent, now, &tx)?;
         tx.commit()?;
@@ -495,20 +491,16 @@ impl DbModule for Sqlite {
     fn update_inode(&mut self, attr: &DBFileAttr, truncate: bool) -> Result<()> {
         let sql = "UPDATE metadata SET \
             size=$1,\
-            atime=datetime($2),\
-            atime_nsec=$3,\
-            mtime=datetime($4),\
-            mtime_nsec=$5,\
-            ctime=datetime($6),\
-            ctime_nsec=$7,\
-            crtime=datetime($8),\
-            crtime_nsec=$9,\
-            mode=$10,\
-            uid=$11,\
-            gid=$12,\
-            rdev=$13,\
-            flags=$14 \
-             WHERE id=$15";
+            atime_ns=$2,\
+            mtime_ns=$3,\
+            ctime_ns=$4,\
+            crtime_ns=$5,\
+            mode=$6,\
+            uid=$7,\
+            gid=$8,\
+            rdev=$9,\
+            flags=$10 \
+             WHERE id=$11";
         let tx = self.conn.transaction()?;
         let oldattr = get_inode_local(attr.ino, &tx)?;
         let oldattr = match oldattr {
@@ -519,27 +511,20 @@ impl DbModule for Sqlite {
                 });
             }
         };
-        let now = Utc::now();
-        let atime = DateTime::<Utc>::from(attr.atime);
+        let now = now_ns();
         let mtime = if oldattr.size != attr.size {
             now
         } else {
-            DateTime::<Utc>::from(attr.mtime)
+            to_ns(attr.mtime)
         };
-        let ctime = now;
-        let crtime = DateTime::<Utc>::from(attr.crtime);
         {
             let mut stmt = tx.prepare(sql)?;
             stmt.execute(params![
                 attr.size,
-                atime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                atime.timestamp_subsec_nanos(),
-                mtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                mtime.timestamp_subsec_nanos(),
-                ctime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                ctime.timestamp_subsec_nanos(),
-                crtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                crtime.timestamp_subsec_nanos(),
+                to_ns(attr.atime),
+                mtime,
+                now,
+                to_ns(attr.crtime),
                 attr.perm,
                 attr.uid,
                 attr.gid,
@@ -590,7 +575,7 @@ impl DbModule for Sqlite {
     }
 
     fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr> {
-        let now = Utc::now();
+        let now = now_ns();
         let tx = self.conn.transaction()?;
         let attr = match get_inode_local(inode, &tx)? {
             Some(n) => n,
@@ -631,7 +616,7 @@ impl DbModule for Sqlite {
 
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32> {
         let sql = "SELECT child_id FROM dentry WHERE parent_id=$1 and name=$2";
-        let now = Utc::now();
+        let now = now_ns();
         let tx = self.conn.transaction()?;
         let child: u32;
         {
@@ -655,7 +640,7 @@ impl DbModule for Sqlite {
         new_name: &str,
     ) -> Result<Option<u32>> {
         let sql = "UPDATE dentry SET parent_id=$1, name=$2 where parent_id=$3 and name=$4";
-        let now = Utc::now();
+        let now = now_ns();
         let tx = self.conn.transaction()?;
         let dentry = match get_dentry_single(parent, name, &tx)? {
             Some(n) => n,
@@ -717,94 +702,54 @@ impl DbModule for Sqlite {
         check_directory_is_empty_local(inode, &self.conn)
     }
 
-    fn lookup(&mut self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
-        let sql = "SELECT \
-            metadata.id,\
-            metadata.size,\
-            metadata.atime,\
-            metadata.atime_nsec,\
-            metadata.mtime,\
-            metadata.mtime_nsec,\
-            metadata.ctime,\
-            metadata.ctime_nsec,\
-            metadata.crtime,\
-            metadata.crtime_nsec,\
-            metadata.kind, \
-            metadata.mode,\
-            ncount.nlink,\
-            metadata.uid,\
-            metadata.gid,\
-            metadata.rdev,\
-            metadata.flags, \
-            blocknum.block_num \
-            FROM dentry \
-            INNER JOIN metadata \
-            ON metadata.id=dentry.child_id \
-            AND dentry.parent_id=$1 \
-            AND dentry.name=$2 \
-            LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data GROUP BY file_id) AS blocknum \
-            ON dentry.child_id = blocknum.file_id \
-            LEFT JOIN ( SELECT child_id, COUNT(child_id) nlink FROM dentry GROUP BY child_id) AS ncount \
-            ON dentry.child_id = ncount.child_id \
-            ";
-        let tx = self.conn.transaction()?;
-        let stmt = tx.prepare(sql)?;
-        let params = params![parent, name];
-        let result = parse_attr(stmt, params);
-        update_atime(parent, Utc::now(), &tx)?;
-        tx.commit()?;
-        result
-    }
-
-    fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>> {
-        let tx = self.conn.transaction()?;
-        let row: Vec<u8>;
-        {
-            let mut stmt = tx.prepare(
-                "SELECT \
-                data FROM data WHERE file_id=$1 AND block_num=$2",
-            )?;
-            row = match stmt.query_row(params![inode, block], |row| row.get(0)) {
-                Ok(n) => n,
-                Err(err) => {
-                    if err == rusqlite::Error::QueryReturnedNoRows {
-                        vec![0; length as usize]
-                    } else {
-                        return Err(Error::from(err));
-                    }
-                }
-            };
+    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
+        match get_dentry_single(parent, name, &self.conn)? {
+            Some(entry) => get_inode_local(entry.child_ino, &self.conn),
+            None => Ok(None),
         }
-        update_atime(inode, Utc::now(), &tx)?;
-        tx.commit()?;
-        Ok(row)
     }
 
-    fn write_data(&mut self, inode: u32, block: u32, data: &[u8], size: u64) -> Result<()> {
+    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>> {
+        let row: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM data WHERE file_id=$1 AND block_num=$2",
+                params![inode, block],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.unwrap_or_else(|| vec![0; length as usize]))
+    }
+
+    fn write_data<B: AsRef<[u8]>>(
+        &mut self,
+        inode: u32,
+        blocks: &[(u32, B)],
+        size: u64,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let db_size: u64 = tx.query_row(
-                "SELECT size FROM metadata WHERE id=$1",
-                params![inode],
-                |row| row.get(0),
-            )?;
-            tx.execute(
-                "REPLACE INTO data \
-            (file_id, block_num, data)
-            VALUES($1, $2, $3)",
-                params![inode, block, data],
-            )?;
-            if size > db_size {
-                tx.execute(
-                    "UPDATE metadata SET size=$1 WHERE id=$2",
-                    params![size, inode],
-                )?;
+            let mut stmt =
+                tx.prepare("REPLACE INTO data (file_id, block_num, data) VALUES($1, $2, $3)")?;
+            for (block, data) in blocks {
+                stmt.execute(params![inode, block, data.as_ref()])?;
             }
         }
-        let time = Utc::now();
+        tx.execute(
+            "UPDATE metadata SET size=max(size, $1) WHERE id=$2",
+            params![size, inode],
+        )?;
+        let time = now_ns();
         update_mtime(inode, time, &tx)?;
         update_ctime(inode, time, &tx)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        // Returns one row (busy, log frames, checkpointed frames); only success matters.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -836,7 +781,7 @@ impl DbModule for Sqlite {
                 params![inode, key, value],
             )?;
         }
-        let time = Utc::now();
+        let time = now_ns();
         update_ctime(inode, time, &tx)?;
         tx.commit()?;
         Ok(())
@@ -887,7 +832,7 @@ impl DbModule for Sqlite {
                 });
             }
         }
-        let time = Utc::now();
+        let time = now_ns();
         update_ctime(inode, time, &tx)?;
         tx.commit()?;
         Ok(())

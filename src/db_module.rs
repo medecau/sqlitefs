@@ -4,7 +4,8 @@ use fuser::{FileAttr, FileType, INodeNo};
 use std::time::SystemTime;
 
 pub trait DbModule {
-    /// Create tables (if not found) and add root directory (if not found)
+    /// Create tables (if not found), migrate legacy text timestamps to integer
+    /// nanoseconds, and add root directory (if not found)
     fn init(&mut self) -> Result<()>;
     /// Get metadata. If not found, return None
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
@@ -37,14 +38,21 @@ pub trait DbModule {
     fn check_directory_is_empty(&self, inode: u32) -> Result<bool>;
     /// lookup a directory entry table and get a file attribute.
     /// If not found, return None.
-    /// Update atime.
-    fn lookup(&mut self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
-    /// Read data from a whole block.
-    /// Update atime.
-    fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
-    /// Write data into a whole block.
-    /// Update mtime and ctime.
-    fn write_data(&mut self, inode: u32, block: u32, data: &[u8], size: u64) -> Result<()>;
+    /// Read-only: atime is never updated (noatime semantics).
+    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
+    /// Read a whole block as stored (it may be shorter than the block size).
+    /// A missing block returns `length` zero bytes. Read-only: no atime update.
+    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
+    /// Store whole blocks `(block_num, bytes)` in one transaction; grow the file
+    /// size to `size` if larger. Update mtime and ctime.
+    fn write_data<B: AsRef<[u8]>>(
+        &mut self,
+        inode: u32,
+        blocks: &[(u32, B)],
+        size: u64,
+    ) -> Result<()>;
+    /// Make all committed transactions durable (forces a WAL checkpoint).
+    fn checkpoint(&self) -> Result<()>;
     /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inodes which nlink is 0.

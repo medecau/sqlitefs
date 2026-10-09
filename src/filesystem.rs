@@ -220,6 +220,18 @@ fn apply_lock(locks: &mut Vec<PosixLock>, owner: u64, pid: u32, start: u64, end:
     locks.extend(other);
 }
 
+/// Write `src` into `block` at `start`, extending the block only as far as the
+/// write reaches. Blocks are never padded to the block size: reads zero-fill
+/// short blocks, so the unwritten tail costs no storage.
+fn overlay(mut block: Vec<u8>, start: usize, src: &[u8]) -> Vec<u8> {
+    let end = start + src.len();
+    if block.len() < end {
+        block.resize(end, 0);
+    }
+    block[start..end].copy_from_slice(src);
+    block
+}
+
 fn remove_locks_for_owner(locks: &mut Vec<PosixLock>, owner: u64) {
     locks.retain(|l| l.owner != owner);
 }
@@ -254,7 +266,7 @@ impl Filesystem for SqliteFs {
                 return;
             }
         };
-        let mut db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let child = match db.lookup(parent, name) {
             Ok(n) => match n {
                 Some(v) => {
@@ -388,7 +400,7 @@ impl Filesystem for SqliteFs {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let ino = ino.0 as u32;
-        let mut db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let attr = match db.get_inode(ino) {
             Ok(n) => match n {
                 Some(attr) => attr,
@@ -638,7 +650,7 @@ impl Filesystem for SqliteFs {
                 return;
             }
         };
-        match db.write_data(ino, 1, data, data.len() as u64) {
+        match db.write_data(ino, &[(1, data)], data.len() as u64) {
             Ok(n) => n,
             Err(err) => {
                 warn!("symlink write_data: {}", err);
@@ -796,7 +808,7 @@ impl Filesystem for SqliteFs {
         reply: ReplyData,
     ) {
         let mut data: Vec<u8> = Vec::with_capacity(size as usize);
-        let mut db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let block_size = db.get_db_block_size();
         let mut size = size;
         let mut offset = offset;
@@ -848,64 +860,42 @@ impl Filesystem for SqliteFs {
         let size = data.len() as u32;
         let start_block = (offset / block_size as u64 + 1) as u32;
         let end_block = ((offset + size as u64 - 1) / block_size as u64 + 1) as u32;
+        let mut blocks: Vec<(u32, Vec<u8>)> = Vec::new();
         for i in start_block..=end_block {
-            let mut block_data: Vec<u8> = Vec::with_capacity(block_size as usize);
             let b_start_index = if i == start_block {
-                (offset % block_size as u64) as u32
+                (offset % block_size as u64) as usize
             } else {
                 0
             };
             let b_end_index = if i == end_block {
-                ((offset + size as u64 - 1) % block_size as u64 + 1) as u32
+                ((offset + size as u64 - 1) % block_size as u64 + 1) as usize
             } else {
-                block_size
+                block_size as usize
             };
-            let data_offset: usize = if i > start_block {
-                (((i - start_block - 1) as u64 * block_size as u64) + block_size as u64
-                    - offset % block_size as u64) as usize
+            // Position in `data` of this block's first written byte.
+            let data_offset =
+                ((i as u64 - 1) * block_size as u64 + b_start_index as u64 - offset) as usize;
+            let src = &data[data_offset..data_offset + (b_end_index - b_start_index)];
+            let block_data = if b_start_index == 0 && b_end_index == block_size as usize {
+                src.to_vec()
             } else {
-                0
-            };
-
-            if (b_start_index != 0) || (b_end_index != block_size) {
-                let mut data_pre = match db.get_data(ino, i, block_size) {
-                    Ok(n) => n,
+                // Partial block: overlay onto what is stored (missing => empty).
+                match db.get_data(ino, i, 0) {
+                    Ok(existing) => overlay(existing, b_start_index, src),
                     Err(err) => {
                         warn!("write get_data: {}", err);
                         reply.error(err.to_errno());
                         return;
                     }
-                };
-                if data_pre.len() < block_size as usize {
-                    data_pre.resize(block_size as usize, 0);
                 }
-                if b_start_index != 0 {
-                    block_data.extend_from_slice(&data_pre[0..b_start_index as usize]);
-                }
-                block_data.extend_from_slice(
-                    &data[data_offset..(data_offset + (b_end_index - b_start_index) as usize)],
-                );
-                if b_end_index != block_size {
-                    block_data
-                        .extend_from_slice(&data_pre[b_end_index as usize..block_size as usize]);
-                }
-            } else {
-                block_data
-                    .extend_from_slice(&data[data_offset..(data_offset + block_size as usize)]);
-            }
-            match db.write_data(
-                ino,
-                i,
-                &block_data,
-                (i as u64 - 1) * block_size as u64 + b_end_index as u64,
-            ) {
-                Ok(n) => n,
-                Err(err) => {
-                    warn!("write write_data: {}", err);
-                    reply.error(err.to_errno());
-                    return;
-                }
-            }
+            };
+            blocks.push((i, block_data));
+        }
+        // One transaction per write request: all blocks and the size, or nothing.
+        if let Err(err) = db.write_data(ino, &blocks, offset + size as u64) {
+            warn!("write write_data: {}", err);
+            reply.error(err.to_errno());
+            return;
         }
         reply.written(size);
     }
@@ -929,6 +919,36 @@ impl Filesystem for SqliteFs {
             handler.remove(&ino);
         }
         reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Writes are already committed; with synchronous=NORMAL only a checkpoint
+        // makes them durable. It covers the whole DB, not just this inode.
+        match self.db.lock().unwrap().checkpoint() {
+            Ok(()) => reply.ok(),
+            Err(err) => {
+                warn!("fsync checkpoint: {}", err);
+                reply.error(err.to_errno());
+            }
+        }
+    }
+
+    fn fsyncdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.fsync(req, ino, fh, datasync, reply);
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -1518,5 +1538,17 @@ mod lock_tests {
         remove_locks_for_owner(&mut locks, 1);
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].owner, 2);
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::overlay;
+
+    #[test]
+    fn partial_blocks_are_not_padded() {
+        assert_eq!(overlay(Vec::new(), 0, b"abc"), b"abc"); // new block: 3 bytes, not 4096
+        assert_eq!(overlay(b"0123456789".to_vec(), 2, b"xy"), b"01xy456789"); // keeps tail
+        assert_eq!(overlay(b"ab".to_vec(), 4, b"z"), b"ab\0\0z"); // gap is zero-filled
     }
 }
