@@ -322,3 +322,27 @@ fn unmount_leaves_a_single_database_file() {
     assert_eq!(db.read_data(ino, 0, 4).unwrap(), b"kept");
     assert_eq!(journal_mode(&path), "wal");
 }
+
+#[test]
+fn grown_chunks_keep_their_head_and_zero_fill_gaps() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    db.write_data(ino, 70_000, b"mid").unwrap(); // new chunk 2, written from byte 4464
+    assert_eq!(db.read_data(ino, 69_999, 5).unwrap(), b"\0mid\0");
+    assert_eq!(chunk_lengths(&path, ino), vec![4467]);
+    db.write_data(ino, 70_001, b"IDDLE").unwrap(); // overlaps the stored tail and extends it
+    assert_eq!(db.read_data(ino, 69_999, 8).unwrap(), b"\0mIDDLE\0");
+    assert_eq!(chunk_lengths(&path, ino), vec![4470]);
+    // substr()/length() count characters on TEXT, so chunks must stay BLOBs.
+    let types: Vec<String> = {
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT typeof(data) FROM data")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(types, vec!["blob"]);
+}

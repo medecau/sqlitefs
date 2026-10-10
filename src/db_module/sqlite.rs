@@ -113,18 +113,6 @@ fn release_data(inode: u32, offset: u64, bs: u32, tx: &Connection) -> Result<()>
     Ok(())
 }
 
-/// Write `src` into `block` at `start`, extending the block only as far as the
-/// write reaches. Blocks are never padded to the block size: reads zero-fill
-/// short blocks, so the unwritten tail costs no storage.
-fn overlay(mut block: Vec<u8>, start: usize, src: &[u8]) -> Vec<u8> {
-    let end = start + src.len();
-    if block.len() < end {
-        block.resize(end, 0);
-    }
-    block[start..end].copy_from_slice(src);
-    block
-}
-
 fn update_mtime(inode: u32, ns: i64, tx: &Connection) -> Result<()> {
     tx.execute(
         "UPDATE metadata SET mtime_ns=$1 WHERE id=$2",
@@ -770,24 +758,28 @@ impl DbModule for Sqlite {
         if size == 0 {
             return Ok(out);
         }
-        // ponytail: loads whole chunks; substr() or blob read_at if small random reads matter.
+        // Per stored chunk: where its bytes land in `out`, and the bytes themselves
+        // (substr past a short chunk's end yields fewer or none). Holes stay zero.
+        // ponytail: SQLite loads each whole chunk before substr(); blob read_at if
+        // small random reads become hot.
         let mut stmt = self.conn.prepare_cached(
-            "SELECT block_num, data FROM data WHERE file_id=$1 AND block_num BETWEEN $2 AND $3",
+            "SELECT max((block_num - 1) * ?4 - ?2, 0), \
+                    substr(data, max(?2 - (block_num - 1) * ?4, 0) + 1, \
+                           ?3 - max(?2, (block_num - 1) * ?4)) \
+             FROM data WHERE file_id = ?1 AND block_num BETWEEN ?5 AND ?6",
         )?;
-        let first = (offset / bs + 1) as i64;
-        let last = ((end - 1) / bs + 1) as i64;
-        let mut rows = stmt.query(params![inode, first, last])?;
+        let mut rows = stmt.query(params![
+            inode,
+            offset as i64,
+            end as i64,
+            bs as i64,
+            (offset / bs + 1) as i64,
+            ((end - 1) / bs + 1) as i64,
+        ])?;
         while let Some(row) = rows.next()? {
-            let chunk_start = (row.get::<_, i64>(0)? as u64 - 1) * bs;
-            let data = row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
-            // Overlap of [chunk_start, chunk_start + len) with [offset, end).
-            let from = offset.max(chunk_start);
-            let to = end.min(chunk_start + data.len() as u64);
-            if from < to {
-                out[(from - offset) as usize..(to - offset) as usize].copy_from_slice(
-                    &data[(from - chunk_start) as usize..(to - chunk_start) as usize],
-                );
-            }
+            let pos = row.get::<_, i64>(0)? as usize;
+            let bytes = row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
+            out[pos..pos + bytes.len()].copy_from_slice(bytes);
         }
         Ok(out)
     }
@@ -824,20 +816,16 @@ impl DbModule for Sqlite {
                         tx.blob_open(DatabaseName::Main, "data", "data", rowid, false)?;
                     blob.write_at(src, s as usize)?;
                 }
-                // Grows the chunk: rewrite it (keep the old head only if not overwritten).
+                // New or growing chunk: SQLite builds head || zero gap || src. `||`
+                // yields TEXT, so CAST back to BLOB (substr/length count bytes).
                 _ => {
-                    let old: Vec<u8> = if stored.is_some() && s > 0 {
-                        tx.query_row(
-                            "SELECT data FROM data WHERE file_id=$1 AND block_num=$2",
-                            params![inode, block as i64],
-                            |row| row.get(0),
-                        )?
-                    } else {
-                        Vec::new()
-                    };
                     tx.execute(
-                        "REPLACE INTO data (file_id, block_num, data) VALUES($1, $2, $3)",
-                        params![inode, block as i64, overlay(old, s as usize, src)],
+                        "INSERT INTO data (file_id, block_num, data) \
+                         VALUES (?1, ?2, CAST(zeroblob(?3) || ?4 AS BLOB)) \
+                         ON CONFLICT (file_id, block_num) DO UPDATE SET data = CAST( \
+                             substr(data, 1, ?3) || zeroblob(max(?3 - length(data), 0)) || ?4 \
+                             AS BLOB)",
+                        params![inode, block as i64, s as i64, src],
                     )?;
                 }
             }
@@ -957,17 +945,5 @@ impl DbModule for Sqlite {
         update_ctime(inode, time, &tx)?;
         tx.commit()?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod overlay_tests {
-    use super::overlay;
-
-    #[test]
-    fn partial_blocks_are_not_padded() {
-        assert_eq!(overlay(Vec::new(), 0, b"abc"), b"abc"); // new block: 3 bytes, not 4096
-        assert_eq!(overlay(b"0123456789".to_vec(), 2, b"xy"), b"01xy456789"); // keeps tail
-        assert_eq!(overlay(b"ab".to_vec(), 4, b"z"), b"ab\0\0z"); // gap is zero-filled
     }
 }
