@@ -49,6 +49,9 @@ pub trait DbModule {
     fn write_data(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<()>;
     /// Make all committed transactions durable (forces a WAL checkpoint).
     fn checkpoint(&self) -> Result<()>;
+    /// Called on unmount: checkpoint the WAL and switch to journal_mode=DELETE,
+    /// leaving one self-contained database file. The next mount re-enables WAL.
+    fn unmount(&self) -> Result<()>;
     /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inodes which nlink is 0.

@@ -8,6 +8,7 @@ MNT="${1:?Usage: smoke-test.sh <mount_point> <binary_path>}"
 BINARY="${2:?Usage: smoke-test.sh <mount_point> <binary_path>}"
 FAILED=0
 OS="$(uname)"
+DBMNT="$MNT-db"  # second mount, file-backed, for the unmount check
 
 # --- OS-specific helpers ---
 
@@ -42,7 +43,7 @@ mkdir -p "$MNT"
 FS_PID=$!
 # Order matters: unmount BEFORE kill so the kernel unwinds the FUSE
 # connection cleanly. Killing first leaves stuck mounts and dentries.
-trap 'unmount_fs "$MNT"; kill $FS_PID 2>/dev/null || true' EXIT
+trap 'unmount_fs "$MNT"; unmount_fs "$DBMNT"; kill $FS_PID 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 50); do
     is_mounted "$MNT" && break
@@ -174,6 +175,22 @@ echo newdata  > "$MNT/src"
 mv -n "$MNT/src" "$MNT/dest" 2>/dev/null || true
 check "V12 noreplace preserves dest" "original" "$(cat "$MNT/dest")"
 rm -f "$MNT/src" "$MNT/dest"
+
+# --- 3b. File-backed DB: unmount leaves one self-contained file ---
+# destroy() switches journal_mode back to DELETE: no -wal/-shm remain and the
+# header's file-format bytes (offsets 18-19) read 1 1 (rollback), not 2 2 (WAL).
+mkdir -p "$DBMNT"
+DBDIR="$(mktemp -d)"
+"$BINARY" "$DBMNT" "$DBDIR/fs.sqlite" &
+DB_PID=$!
+for _ in $(seq 1 50); do is_mounted "$DBMNT" && break; sleep 0.1; done
+is_mounted "$DBMNT" || { echo "FAIL: file-backed mount never became live"; exit 1; }
+echo kept > "$DBMNT/f"
+unmount_fs "$DBMNT"
+wait "$DB_PID" || true
+check "unmount leaves one db file" "fs.sqlite" "$(ls -A "$DBDIR")"
+check "unmount leaves rollback journal" "1 1" "$(od -An -tu1 -j18 -N2 "$DBDIR/fs.sqlite" | xargs)"
+rm -rf "$DBDIR"
 
 # --- 4. Report ---
 echo

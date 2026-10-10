@@ -22,7 +22,10 @@ If a database file name isn't specified, sqlite-fs use in-memory-db instead of a
 All data will be deleted when the filesystem is closed.
 
 A file-backed database runs in SQLite's WAL mode: while mounted, `<db_path>-wal` and
-`<db_path>-shm` sit next to it. Unmount before copying the database, or copy all three files.
+`<db_path>-shm` sit next to it. On unmount sqlite-fs switches the file back to rollback-journal
+mode, leaving one self-contained database file. Unmount before copying the database, or copy
+all three files. If the process is killed without unmounting, the `-wal` file stays and is
+recovered on the next mount.
 Databases created by older versions are migrated to integer timestamps on first mount.
 File data is stored in 64 KiB chunks; databases created by older versions keep their 4 KiB chunks.
 

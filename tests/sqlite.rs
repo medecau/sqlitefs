@@ -284,3 +284,41 @@ fn writes_beyond_the_addressable_size_fail_with_efbig() {
     assert_eq!(err.to_errno().code(), fuser::Errno::EFBIG.code());
     assert_eq!(db.read_data(ino, limit, 1).unwrap(), vec![0]);
 }
+
+fn files_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn journal_mode(path: &std::path::Path) -> String {
+    Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn unmount_leaves_a_single_database_file() {
+    let (dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    db.write_data(ino, 0, b"kept").unwrap();
+    assert!(
+        files_in(dir.path()).len() > 1,
+        "WAL files exist while mounted"
+    );
+    db.unmount().unwrap();
+    // Checked while the connection is still open: destroy() runs before the drop.
+    assert_eq!(files_in(dir.path()), vec!["chunks.sqlite"]);
+    drop(db);
+    assert_eq!(journal_mode(&path), "delete");
+
+    // The next mount switches back to WAL and sees the data.
+    let mut db = sqlite::Sqlite::new(&path).unwrap();
+    db.init().unwrap();
+    assert_eq!(db.read_data(ino, 0, 4).unwrap(), b"kept");
+    assert_eq!(journal_mode(&path), "wal");
+}

@@ -243,6 +243,9 @@ impl Filesystem for SqliteFs {
                 Err(err) => warn!("destroy: delete_inode_if_noref({}): {}", key, err),
             }
         }
+        if let Err(err) = db.unmount() {
+            warn!("destroy: unmount: {}", err);
+        }
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {

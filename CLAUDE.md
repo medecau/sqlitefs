@@ -55,7 +55,7 @@ The codebase has three layers:
 - Foreign keys are explicitly enabled on every connection (`PRAGMA foreign_keys=ON`) since SQLite disables them by default.
 - Timestamps are stored as integer nanoseconds since the epoch (`*_ns` columns), saturating outside 1677–2262. `init()` migrates databases that still have the old text + `*_nsec` columns in place.
 - `nlink` and `blocks` are computed with `count(*)` scalar subqueries (the `metadata.nlink` column is unused), so an unlinked-but-open inode reports `nlink` 0. `blocks` is st_blocks in 512-byte units: stored chunks x `block_size`, capped at the size rounded up to 512.
-- File-backed DBs use `journal_mode=WAL` with `synchronous=NORMAL`: commits are not fsync'd until a checkpoint, which the `fsync`/`fsyncdir` handlers force via `DbModule::checkpoint`.
+- File-backed DBs use `journal_mode=WAL` with `synchronous=NORMAL`: commits are not fsync'd until a checkpoint, which the `fsync`/`fsyncdir` handlers force via `DbModule::checkpoint`. `destroy()` calls `DbModule::unmount`, which switches to `journal_mode=DELETE` so an unmounted DB is one file (header no longer marks it WAL); `Sqlite::new` re-enables WAL on the next mount.
 - Reads never write: no atime updates on lookup or read (noatime semantics). Each `write()` request stores all its chunks, the new size, and mtime/ctime in one transaction. A write that lands inside a chunk's stored bytes patches them via incremental blob I/O (`blob_open`/`write_at`); one that extends a chunk rewrites it. Writes or truncates past `u32::MAX * block_size` fail with `EFBIG`.
 
 ## Error Handling

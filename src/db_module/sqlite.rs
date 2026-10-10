@@ -860,6 +860,20 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
+    fn unmount(&self) -> Result<()> {
+        // Returns the resulting mode; it stays "wal" if the switch was refused
+        // (e.g. another connection has the file open). In-memory DBs report "memory".
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        if mode == "wal" {
+            return Err(Error::SqliteError {
+                description: "could not leave WAL mode; -wal/-shm files remain".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn release_data(&self, inode: u32) -> Result<()> {
         self.conn
             .execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
