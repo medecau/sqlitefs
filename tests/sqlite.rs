@@ -68,7 +68,7 @@ fn reads_do_not_touch_atime() {
         db.update_inode(&attr, false).unwrap();
     }
     db.lookup(1, "f").unwrap();
-    db.get_data(ino, 1, 4096).unwrap();
+    db.read_data(ino, 0, 4096).unwrap();
     assert_eq!(db.get_inode(1).unwrap().unwrap().atime, old);
     assert_eq!(db.get_inode(ino).unwrap().unwrap().atime, old);
 }
@@ -121,6 +121,11 @@ fn legacy_text_timestamps_are_migrated() {
     }
     let mut db = sqlite::Sqlite::new(&path).unwrap();
     db.init().unwrap();
+    assert_eq!(
+        db.get_db_block_size(),
+        4096,
+        "existing databases keep their 4 KiB block layout"
+    );
 
     let root = db.get_inode(1).unwrap().unwrap();
     assert_eq!(
@@ -173,4 +178,109 @@ fn link_count_queries_use_the_child_index() {
         plan.iter().any(|d| d.contains("dentry_child_id")),
         "{plan:?}"
     );
+}
+
+/// File-backed fresh DB plus a raw connection for inspecting the stored chunks.
+fn file_db() -> (tempfile::TempDir, std::path::PathBuf, sqlite::Sqlite) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chunks.sqlite");
+    let mut db = sqlite::Sqlite::new(&path).unwrap();
+    db.init().unwrap();
+    (dir, path, db)
+}
+
+fn chunk_lengths(path: &std::path::Path, ino: u32) -> Vec<i64> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT length(data) FROM data WHERE file_id = ? ORDER BY block_num")
+        .unwrap();
+    stmt.query_map([ino], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[test]
+fn new_db_stores_64k_chunks_unpadded() {
+    let (_dir, path, mut db) = file_db();
+    assert_eq!(db.get_db_block_size(), 65536);
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    for (i, piece) in data.chunks(128 * 1024).enumerate() {
+        db.write_data(ino, i as u64 * 128 * 1024, piece).unwrap();
+    }
+    assert_eq!(db.read_data(ino, 0, 200_000).unwrap(), data);
+    assert_eq!(
+        db.read_data(ino, 65_000, 1_000).unwrap(),
+        data[65_000..66_000]
+    );
+    // 3 full chunks and a 3,392-byte tail, stored as written (not padded to 64 KiB).
+    assert_eq!(chunk_lengths(&path, ino), vec![65536, 65536, 65536, 3392]);
+    let attr = db.get_inode(ino).unwrap().unwrap();
+    assert_eq!((attr.size, attr.blocks), (200_000, 391)); // st_blocks: 512-byte units
+}
+
+#[test]
+fn small_writes_patch_in_place_or_grow_the_chunk() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    let rowid = |path: &std::path::Path| -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT rowid FROM data", [], |r| r.get(0))
+            .unwrap()
+    };
+    db.write_data(ino, 0, b"0123456789").unwrap();
+    let before = rowid(&path);
+    db.write_data(ino, 2, b"xy").unwrap(); // inside the stored bytes
+    assert_eq!(db.read_data(ino, 0, 10).unwrap(), b"01xy456789");
+    assert_eq!(chunk_lengths(&path, ino), vec![10]);
+    assert_eq!(rowid(&path), before, "patched in place, not REPLACEd");
+    db.write_data(ino, 20, b"z").unwrap(); // past the stored bytes: grows, gap reads as zeros
+    assert_eq!(
+        db.read_data(ino, 8, 13).unwrap(),
+        b"89\0\0\0\0\0\0\0\0\0\0z"
+    );
+    assert_eq!(chunk_lengths(&path, ino), vec![21]);
+    assert_eq!(db.get_inode(ino).unwrap().unwrap().size, 21);
+}
+
+#[test]
+fn sparse_files_store_only_written_chunks() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    db.write_data(ino, 1 << 20, b"tail").unwrap();
+    assert_eq!(db.read_data(ino, 0, 8).unwrap(), vec![0; 8]);
+    assert_eq!(db.read_data(ino, 1 << 20, 4).unwrap(), b"tail");
+    assert_eq!(chunk_lengths(&path, ino), vec![4]);
+    let attr = db.get_inode(ino).unwrap().unwrap();
+    assert_eq!(attr.size, (1 << 20) + 4);
+    assert_eq!(
+        attr.blocks, 128,
+        "one allocated 64 KiB chunk, not the whole 1 MiB"
+    );
+}
+
+#[test]
+fn truncate_cuts_the_boundary_chunk_without_padding() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    db.write_data(ino, 0, &vec![7u8; 100_000]).unwrap();
+    let mut attr = db.get_inode(ino).unwrap().unwrap();
+    attr.size = 70_000;
+    db.update_inode(&attr, true).unwrap();
+    assert_eq!(chunk_lengths(&path, ino), vec![65536, 4464]);
+    attr.size = 200_000; // growing again exposes zeros, not the old bytes
+    db.update_inode(&attr, false).unwrap();
+    assert_eq!(db.read_data(ino, 69_998, 4).unwrap(), vec![7, 7, 0, 0]);
+}
+
+#[test]
+fn writes_beyond_the_addressable_size_fail_with_efbig() {
+    let mut db = fresh_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    let limit = u32::MAX as u64 * db.get_db_block_size() as u64;
+    let err = db.write_data(ino, limit, b"x").unwrap_err();
+    assert_eq!(err.to_errno().code(), fuser::Errno::EFBIG.code());
+    assert_eq!(db.read_data(ino, limit, 1).unwrap(), vec![0]);
 }

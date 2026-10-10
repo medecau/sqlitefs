@@ -40,24 +40,20 @@ pub trait DbModule {
     /// If not found, return None.
     /// Read-only: atime is never updated (noatime semantics).
     fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
-    /// Read a whole block as stored (it may be shorter than the block size).
-    /// A missing block returns `length` zero bytes. Read-only: no atime update.
-    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
-    /// Store whole blocks `(block_num, bytes)` in one transaction; grow the file
-    /// size to `size` if larger. Update mtime and ctime.
-    fn write_data<B: AsRef<[u8]>>(
-        &mut self,
-        inode: u32,
-        blocks: &[(u32, B)],
-        size: u64,
-    ) -> Result<()>;
+    /// Read `size` bytes at `offset`; ranges with no stored data read as zeros.
+    /// Read-only: no atime update.
+    fn read_data(&self, inode: u32, offset: u64, size: u32) -> Result<Vec<u8>>;
+    /// Write `data` at `offset` in one transaction; grow the file size to the
+    /// end of the write if larger. Update mtime and ctime. Fails with EFBIG past
+    /// the largest addressable size.
+    fn write_data(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<()>;
     /// Make all committed transactions durable (forces a WAL checkpoint).
     fn checkpoint(&self) -> Result<()>;
     /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inodes which nlink is 0.
     fn delete_all_noref_inode(&mut self) -> Result<()>;
-    /// Get block size of the filesystem
+    /// Chunk size of stored file data (per database: 65536 new, 4096 legacy)
     fn get_db_block_size(&self) -> u32;
     /// Set xattr value.
     fn set_xattr(&mut self, inode: u32, key: &str, value: &[u8]) -> Result<()>;
@@ -75,8 +71,8 @@ pub struct DBFileAttr {
     pub ino: u32,
     /// Size in bytes
     pub size: u64,
-    /// block size
-    pub blocks: u32,
+    /// Allocated size in 512-byte units (st_blocks)
+    pub blocks: u64,
     /// Time of last access
     pub atime: SystemTime,
     /// Time of last modification
@@ -106,7 +102,7 @@ impl DBFileAttr {
         FileAttr {
             ino: INodeNo(self.ino as u64),
             size: self.size,
-            blocks: self.blocks as u64,
+            blocks: self.blocks,
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,

@@ -220,18 +220,6 @@ fn apply_lock(locks: &mut Vec<PosixLock>, owner: u64, pid: u32, start: u64, end:
     locks.extend(other);
 }
 
-/// Write `src` into `block` at `start`, extending the block only as far as the
-/// write reaches. Blocks are never padded to the block size: reads zero-fill
-/// short blocks, so the unwritten tail costs no storage.
-fn overlay(mut block: Vec<u8>, start: usize, src: &[u8]) -> Vec<u8> {
-    let end = start + src.len();
-    if block.len() < end {
-        block.resize(end, 0);
-    }
-    block[start..end].copy_from_slice(src);
-    block
-}
-
 fn remove_locks_for_owner(locks: &mut Vec<PosixLock>, owner: u64) {
     locks.retain(|l| l.owner != owner);
 }
@@ -421,16 +409,13 @@ impl Filesystem for SqliteFs {
             return;
         }
         let size = attr.size;
-        let mut data = match db.get_data(ino, 1, size as u32) {
-            Ok(n) => n,
+        match db.read_data(ino, 0, size as u32) {
+            Ok(data) => reply.data(&data),
             Err(err) => {
-                warn!("readlink get_data: {}", err);
+                warn!("readlink read_data: {}", err);
                 reply.error(err.to_errno());
-                return;
             }
-        };
-        data.resize(size as usize, 0);
-        reply.data(&data);
+        }
     }
 
     fn mkdir(
@@ -650,7 +635,7 @@ impl Filesystem for SqliteFs {
                 return;
             }
         };
-        match db.write_data(ino, &[(1, data)], data.len() as u64) {
+        match db.write_data(ino, 0, data) {
             Ok(n) => n,
             Err(err) => {
                 warn!("symlink write_data: {}", err);
@@ -807,35 +792,14 @@ impl Filesystem for SqliteFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let mut data: Vec<u8> = Vec::with_capacity(size as usize);
         let db = self.db.lock().unwrap();
-        let block_size = db.get_db_block_size();
-        let mut size = size;
-        let mut offset = offset;
-        while size > 0 {
-            let b_num = (offset / block_size as u64 + 1) as u32;
-            let mut block_data = match db.get_data(ino.0 as u32, b_num, block_size) {
-                Ok(n) => n,
-                Err(err) => {
-                    warn!("read get_data: {}", err);
-                    reply.error(err.to_errno());
-                    return;
-                }
-            };
-            let b_offset = (offset % block_size as u64) as u32;
-            let b_end = if (size + b_offset) / block_size >= 1 {
-                block_size
-            } else {
-                size + b_offset
-            };
-            if block_data.len() < b_end as usize {
-                block_data.resize(b_end as usize, 0);
+        match db.read_data(ino.0 as u32, offset, size) {
+            Ok(data) => reply.data(&data),
+            Err(err) => {
+                warn!("read read_data: {}", err);
+                reply.error(err.to_errno());
             }
-            data.append(&mut block_data[b_offset as usize..b_end as usize].to_vec());
-            offset += (b_end - b_offset) as u64;
-            size -= b_end - b_offset;
         }
-        reply.data(&data);
     }
 
     fn write(
@@ -855,49 +819,13 @@ impl Filesystem for SqliteFs {
             return;
         }
         let mut db = self.db.lock().unwrap();
-        let block_size = db.get_db_block_size();
-        let ino = ino.0 as u32;
-        let size = data.len() as u32;
-        let start_block = (offset / block_size as u64 + 1) as u32;
-        let end_block = ((offset + size as u64 - 1) / block_size as u64 + 1) as u32;
-        let mut blocks: Vec<(u32, Vec<u8>)> = Vec::new();
-        for i in start_block..=end_block {
-            let b_start_index = if i == start_block {
-                (offset % block_size as u64) as usize
-            } else {
-                0
-            };
-            let b_end_index = if i == end_block {
-                ((offset + size as u64 - 1) % block_size as u64 + 1) as usize
-            } else {
-                block_size as usize
-            };
-            // Position in `data` of this block's first written byte.
-            let data_offset =
-                ((i as u64 - 1) * block_size as u64 + b_start_index as u64 - offset) as usize;
-            let src = &data[data_offset..data_offset + (b_end_index - b_start_index)];
-            let block_data = if b_start_index == 0 && b_end_index == block_size as usize {
-                src.to_vec()
-            } else {
-                // Partial block: overlay onto what is stored (missing => empty).
-                match db.get_data(ino, i, 0) {
-                    Ok(existing) => overlay(existing, b_start_index, src),
-                    Err(err) => {
-                        warn!("write get_data: {}", err);
-                        reply.error(err.to_errno());
-                        return;
-                    }
-                }
-            };
-            blocks.push((i, block_data));
-        }
-        // One transaction per write request: all blocks and the size, or nothing.
-        if let Err(err) = db.write_data(ino, &blocks, offset + size as u64) {
+        // One transaction per write request: all chunks and the size, or nothing.
+        if let Err(err) = db.write_data(ino.0 as u32, offset, data) {
             warn!("write write_data: {}", err);
             reply.error(err.to_errno());
             return;
         }
-        reply.written(size);
+        reply.written(data.len() as u32);
     }
 
     fn release(
@@ -1538,17 +1466,5 @@ mod lock_tests {
         remove_locks_for_owner(&mut locks, 1);
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].owner, 2);
-    }
-}
-
-#[cfg(test)]
-mod overlay_tests {
-    use super::overlay;
-
-    #[test]
-    fn partial_blocks_are_not_padded() {
-        assert_eq!(overlay(Vec::new(), 0, b"abc"), b"abc"); // new block: 3 bytes, not 4096
-        assert_eq!(overlay(b"0123456789".to_vec(), 2, b"xy"), b"01xy456789"); // keeps tail
-        assert_eq!(overlay(b"ab".to_vec(), 4, b"z"), b"ab\0\0z"); // gap is zero-filled
     }
 }

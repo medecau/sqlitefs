@@ -42,20 +42,21 @@ The codebase has three layers:
 `DbModule` is a trait defining all storage operations. `DBFileAttr` is the internal inode struct. All filesystem methods call through this trait.
 
 **3. SQLite implementation (`src/db_module/sqlite.rs`)**  
-`Sqlite` implements `DbModule` using `rusqlite`. The database schema has four tables:
+`Sqlite` implements `DbModule` using `rusqlite`. The database schema has five tables:
 - `metadata` — inode attributes (size, timestamps, permissions, uid/gid)
 - `dentry` — directory entries mapping `(parent_id, name)` → `child_id`; index `dentry_child_id` on `child_id` backs link counts and the cascade check
-- `data` — file content in blocks of up to 4096 bytes keyed by `(file_id, block_num)` (1-based); partial blocks are stored unpadded and reads zero-fill, missing rows are holes
+- `data` — file content in chunks of up to `block_size` bytes keyed by `(file_id, block_num)` (1-based); partial chunks are stored unpadded and reads zero-fill, missing rows are holes
 - `xattr` — extended attributes as key/value pairs per inode
+- `config` — `block_size` row: 65536 for new databases, 4096 for databases created before the table existed (kept as-is, no migration)
 
 **Key design decisions:**
 - Inode deletion is deferred: an inode is only deleted when its `dentry` reference count drops to zero AND the kernel has issued `forget` (tracked via `lookup_count`). This correctly handles the POSIX case of deleting an open file.
 - `macOS` vs Linux: `readdir` has two `#[cfg]` implementations because the macOS FUSE API doesn't cache dentries at `opendir` time the same way.
 - Foreign keys are explicitly enabled on every connection (`PRAGMA foreign_keys=ON`) since SQLite disables them by default.
 - Timestamps are stored as integer nanoseconds since the epoch (`*_ns` columns), saturating outside 1677–2262. `init()` migrates databases that still have the old text + `*_nsec` columns in place.
-- `nlink` and `blocks` are computed with `count(*)` scalar subqueries (the `metadata.nlink` column is unused), so an unlinked-but-open inode reports `nlink` 0.
+- `nlink` and `blocks` are computed with `count(*)` scalar subqueries (the `metadata.nlink` column is unused), so an unlinked-but-open inode reports `nlink` 0. `blocks` is st_blocks in 512-byte units: stored chunks x `block_size`, capped at the size rounded up to 512.
 - File-backed DBs use `journal_mode=WAL` with `synchronous=NORMAL`: commits are not fsync'd until a checkpoint, which the `fsync`/`fsyncdir` handlers force via `DbModule::checkpoint`.
-- Reads never write: no atime updates on lookup or read (noatime semantics). Each `write()` request stores all its blocks, the new size, and mtime/ctime in one transaction.
+- Reads never write: no atime updates on lookup or read (noatime semantics). Each `write()` request stores all its chunks, the new size, and mtime/ctime in one transaction. A write that lands inside a chunk's stored bytes patches them via incremental blob I/O (`blob_open`/`write_at`); one that extends a chunk rewrites it. Writes or truncates past `u32::MAX * block_size` fail with `EFBIG`.
 
 ## Error Handling
 

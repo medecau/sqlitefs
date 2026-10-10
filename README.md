@@ -24,6 +24,7 @@ All data will be deleted when the filesystem is closed.
 A file-backed database runs in SQLite's WAL mode: while mounted, `<db_path>-wal` and
 `<db_path>-shm` sit next to it. Unmount before copying the database, or copy all three files.
 Databases created by older versions are migrated to integer timestamps on first mount.
+File data is stored in 64 KiB chunks; databases created by older versions keep their 4 KiB chunks.
 
 ### Unmount a filesystem
 

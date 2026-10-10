@@ -142,12 +142,12 @@ fi
 # the count visible to the substitution while satisfying set -e.
 check "V06 no orphan dentry" "0" "$(ls "$MNT" 2>/dev/null | grep -c bad-sym || true)"
 
-# V08: lookup block count — write 3 blocks, verify per-file count (GROUP BY fix).
-# sqlitefs reports blocks in native 4096-byte units without converting to the POSIX
-# 512-byte st_blocks unit, so stat returns 3 (not 24). The important invariant is
-# that this is THIS file's count only, not a cumulative total (the GROUP BY bug).
+# V08: lookup block count — write 12 KiB, verify per-file count (GROUP BY fix).
+# st_blocks is in POSIX 512-byte units and capped by the file size, so the one
+# short 64 KiB chunk reports 24. The important invariant is that this is THIS
+# file's count only, not a cumulative total (the GROUP BY bug).
 dd if=/dev/zero of="$MNT/blockcheck" bs=4096 count=3 status=none
-check "V08 block count" "3" "$(stat_blocks "$MNT/blockcheck")"
+check "V08 block count" "24" "$(stat_blocks "$MNT/blockcheck")"
 rm "$MNT/blockcheck"
 
 # V11: removexattr on a missing key must fail with ENODATA, not succeed silently

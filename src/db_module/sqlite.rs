@@ -3,7 +3,7 @@ use crate::sqerror::{Error, Result};
 use fuser::FileType;
 use log::{debug, warn};
 use rusqlite::types::ToSql;
-use rusqlite::{params, Connection, OptionalExtension, Statement};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Statement};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,10 @@ const DB_IFREG: u32 = 0o0_100_000;
 const DB_IFLNK: u32 = 0o0_120_000;
 const DB_IFSOCK: u32 = 0o0_140_000;
 
-const BLOCK_SIZE: u32 = 4096;
+/// Chunk size for new databases. Databases created before the `config` table
+/// existed keep 4096 (the size their chunks were written with).
+const NEW_DB_BLOCK_SIZE: u32 = 65536;
+const LEGACY_BLOCK_SIZE: u32 = 4096;
 
 /// Timestamps are stored as i64 nanoseconds since the Unix epoch. Times outside
 /// that range (before 1677 or after 2262) saturate instead of failing.
@@ -90,40 +93,36 @@ fn const_to_file_type(kind: u32) -> FileType {
     }
 }
 
-/// Release all data in "inode", after "offset" byte.
-fn release_data(inode: u32, offset: u64, tx: &Connection) -> Result<()> {
-    if offset == 0 {
-        tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
-    } else {
-        let mut block = (offset / BLOCK_SIZE as u64) as u32;
-        if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            block = (offset / BLOCK_SIZE as u64) as u32 + 1;
-            let sql = "SELECT data FROM data WHERE file_id=$1 and block_num = $2";
-            let mut stmt = tx.prepare(sql)?;
-            let mut data: Vec<u8> = match stmt.query_row(params![inode, block], |row| row.get(0)) {
-                Ok(n) => n,
-                Err(err) => {
-                    if err == rusqlite::Error::QueryReturnedNoRows {
-                        vec![0; BLOCK_SIZE as usize]
-                    } else {
-                        return Err(Error::from(err));
-                    }
-                }
-            };
-            data.resize((offset % BLOCK_SIZE as u64) as usize, 0);
-            tx.execute(
-                "REPLACE INTO data \
-            (file_id, block_num, data)
-            VALUES($1, $2, $3)",
-                params![inode, block, data],
-            )?;
-        }
+/// Release all data in "inode" after "offset" byte: drop the chunks past it and
+/// cut the boundary chunk short (never padded).
+fn release_data(inode: u32, offset: u64, bs: u32, tx: &Connection) -> Result<()> {
+    let bs = bs as u64;
+    let last = offset.div_ceil(bs) as i64; // chunks 1..=last hold bytes below offset
+    tx.execute(
+        "DELETE FROM data WHERE file_id=$1 AND block_num > $2",
+        params![inode, last],
+    )?;
+    let keep = offset % bs;
+    if keep != 0 {
         tx.execute(
-            "DELETE FROM data WHERE file_id=$1 and block_num > $2",
-            params![inode, block],
+            "UPDATE data SET data = substr(data, 1, ?3) \
+             WHERE file_id=?1 AND block_num=?2 AND length(data) > ?3",
+            params![inode, last, keep as i64],
         )?;
     }
     Ok(())
+}
+
+/// Write `src` into `block` at `start`, extending the block only as far as the
+/// write reaches. Blocks are never padded to the block size: reads zero-fill
+/// short blocks, so the unwritten tail costs no storage.
+fn overlay(mut block: Vec<u8>, start: usize, src: &[u8]) -> Vec<u8> {
+    let end = start + src.len();
+    if block.len() < end {
+        block.resize(end, 0);
+    }
+    block[start..end].copy_from_slice(src);
+    block
 }
 
 fn update_mtime(inode: u32, ns: i64, tx: &Connection) -> Result<()> {
@@ -186,16 +185,20 @@ fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFil
     }
 }
 
-fn get_inode_local(inode: u32, tx: &Connection) -> Result<Option<DBFileAttr>> {
+fn get_inode_local(inode: u32, bs: u32, tx: &Connection) -> Result<Option<DBFileAttr>> {
     // Scalar subqueries always yield a count (0, never NULL), so an unlinked but
     // still-open inode reports nlink 0; dentry_child_id keeps the count indexed.
+    // st_blocks (512-byte units): stored chunks, capped by the size rounded up, so
+    // a short tail chunk is not counted as a whole chunk. ?N, not $N: SQLite
+    // numbers $N parameters by first appearance, and ?2 comes before ?1 here.
     let sql = "SELECT id, size, atime_ns, mtime_ns, ctime_ns, crtime_ns, kind, mode, \
             (SELECT count(*) FROM dentry WHERE child_id = metadata.id), \
             uid, gid, rdev, flags, \
-            (SELECT count(*) FROM data WHERE file_id = metadata.id) \
-            FROM metadata WHERE id=$1";
+            min((SELECT count(*) FROM data WHERE file_id = metadata.id) * ?2, \
+                (size + 511) / 512 * 512) / 512 \
+            FROM metadata WHERE id=?1";
     let stmt = tx.prepare(sql)?;
-    let params = params![inode];
+    let params = params![inode, bs];
     parse_attr(stmt, params)
 }
 
@@ -286,6 +289,8 @@ fn add_inode_local(attr: &DBFileAttr, tx: &Connection) -> Result<u32> {
 
 pub struct Sqlite {
     conn: Connection,
+    /// Chunk size of the `data` table; read from `config` by init().
+    block_size: u32,
 }
 
 impl Sqlite {
@@ -297,14 +302,27 @@ impl Sqlite {
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
         )?;
-        Ok(Sqlite { conn })
+        Ok(Sqlite {
+            conn,
+            block_size: NEW_DB_BLOCK_SIZE,
+        })
     }
 
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         // enable foreign key. Sqlite ignores foreign key by default.
         conn.execute("PRAGMA foreign_keys=ON", [])?;
-        Ok(Sqlite { conn })
+        Ok(Sqlite {
+            conn,
+            block_size: NEW_DB_BLOCK_SIZE,
+        })
+    }
+}
+
+impl Sqlite {
+    /// Largest file size whose last chunk number still fits block_num (u32).
+    fn max_file_size(&self) -> u64 {
+        u32::MAX as u64 * self.block_size as u64
     }
 }
 
@@ -312,10 +330,12 @@ impl DbModule for Sqlite {
     fn init(&mut self) -> Result<()> {
         let table_search_sql =
             "SELECT count(name) FROM sqlite_master WHERE type='table' AND name=$1";
+        let fresh: bool;
         {
             let row_count: u32 =
                 self.conn
                     .query_row(table_search_sql, params!["metadata"], |row| row.get(0))?;
+            fresh = row_count == 0;
             if row_count == 0 {
                 let sql = "CREATE TABLE metadata(\
                     id integer primary key autoincrement,\
@@ -399,6 +419,35 @@ impl DbModule for Sqlite {
             }
         }
         {
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS config(name text primary key, value)",
+                [],
+            )?;
+            let default = if fresh {
+                NEW_DB_BLOCK_SIZE
+            } else {
+                LEGACY_BLOCK_SIZE
+            };
+            self.conn.execute(
+                "INSERT OR IGNORE INTO config VALUES('block_size', $1)",
+                params![default],
+            )?;
+            let bs: i64 = self.conn.query_row(
+                "SELECT value FROM config WHERE name='block_size'",
+                [],
+                |row| row.get(0),
+            )?;
+            // A crafted database must not make chunk arithmetic divide by zero.
+            self.block_size = match u32::try_from(bs) {
+                Ok(bs) if (512..=1 << 24).contains(&bs) => bs,
+                _ => {
+                    return Err(Error::FsParm {
+                        description: format!("invalid block_size {} in config", bs),
+                    })
+                }
+            };
+        }
+        {
             let sql = "SELECT count(id) FROM metadata WHERE id=1";
             let row_count: u32 = self.conn.query_row(sql, params![], |row| row.get(0))?;
             if row_count == 0 {
@@ -452,7 +501,7 @@ impl DbModule for Sqlite {
     }
 
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>> {
-        get_inode_local(inode, &self.conn)
+        get_inode_local(inode, self.block_size, &self.conn)
     }
 
     fn add_inode_and_dentry(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32> {
@@ -501,8 +550,13 @@ impl DbModule for Sqlite {
             rdev=$9,\
             flags=$10 \
              WHERE id=$11";
+        if truncate && attr.size > self.max_file_size() {
+            return Err(Error::FsFileTooBig {
+                description: format!("{} exceeds {}", attr.size, self.max_file_size()),
+            });
+        }
         let tx = self.conn.transaction()?;
-        let oldattr = get_inode_local(attr.ino, &tx)?;
+        let oldattr = get_inode_local(attr.ino, self.block_size, &tx)?;
         let oldattr = match oldattr {
             Some(n) => n,
             None => {
@@ -534,7 +588,7 @@ impl DbModule for Sqlite {
             ])?;
         }
         if truncate {
-            release_data(attr.ino, attr.size, &tx)?;
+            release_data(attr.ino, attr.size, self.block_size, &tx)?;
         }
         tx.commit()?;
         Ok(())
@@ -577,7 +631,7 @@ impl DbModule for Sqlite {
     fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr> {
         let now = now_ns();
         let tx = self.conn.transaction()?;
-        let attr = match get_inode_local(inode, &tx)? {
+        let attr = match get_inode_local(inode, self.block_size, &tx)? {
             Some(n) => n,
             None => {
                 return Err(Error::FsNoEnt {
@@ -610,7 +664,7 @@ impl DbModule for Sqlite {
         // Re-fetch after commit so nlink reflects the new dentry count.
         // get_inode_local computes nlink via COUNT(child_id) in dentry, so it
         // must run after the transaction that adds the hard-link dentry is committed.
-        let fresh_attr = get_inode_local(inode, &self.conn)?.unwrap_or(attr);
+        let fresh_attr = get_inode_local(inode, self.block_size, &self.conn)?.unwrap_or(attr);
         Ok(fresh_attr)
     }
 
@@ -704,40 +758,93 @@ impl DbModule for Sqlite {
 
     fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
         match get_dentry_single(parent, name, &self.conn)? {
-            Some(entry) => get_inode_local(entry.child_ino, &self.conn),
+            Some(entry) => get_inode_local(entry.child_ino, self.block_size, &self.conn),
             None => Ok(None),
         }
     }
 
-    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>> {
-        let row: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT data FROM data WHERE file_id=$1 AND block_num=$2",
-                params![inode, block],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(row.unwrap_or_else(|| vec![0; length as usize]))
+    fn read_data(&self, inode: u32, offset: u64, size: u32) -> Result<Vec<u8>> {
+        let bs = self.block_size as u64;
+        let end = offset + size as u64;
+        let mut out = vec![0; size as usize];
+        if size == 0 {
+            return Ok(out);
+        }
+        // ponytail: loads whole chunks; substr() or blob read_at if small random reads matter.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT block_num, data FROM data WHERE file_id=$1 AND block_num BETWEEN $2 AND $3",
+        )?;
+        let first = (offset / bs + 1) as i64;
+        let last = ((end - 1) / bs + 1) as i64;
+        let mut rows = stmt.query(params![inode, first, last])?;
+        while let Some(row) = rows.next()? {
+            let chunk_start = (row.get::<_, i64>(0)? as u64 - 1) * bs;
+            let data = row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
+            // Overlap of [chunk_start, chunk_start + len) with [offset, end).
+            let from = offset.max(chunk_start);
+            let to = end.min(chunk_start + data.len() as u64);
+            if from < to {
+                out[(from - offset) as usize..(to - offset) as usize].copy_from_slice(
+                    &data[(from - chunk_start) as usize..(to - chunk_start) as usize],
+                );
+            }
+        }
+        Ok(out)
     }
 
-    fn write_data<B: AsRef<[u8]>>(
-        &mut self,
-        inode: u32,
-        blocks: &[(u32, B)],
-        size: u64,
-    ) -> Result<()> {
+    fn write_data(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let bs = self.block_size as u64;
+        let end = offset + data.len() as u64;
+        if end > self.max_file_size() {
+            return Err(Error::FsFileTooBig {
+                description: format!("write to {} exceeds {}", end, self.max_file_size()),
+            });
+        }
         let tx = self.conn.transaction()?;
-        {
-            let mut stmt =
-                tx.prepare("REPLACE INTO data (file_id, block_num, data) VALUES($1, $2, $3)")?;
-            for (block, data) in blocks {
-                stmt.execute(params![inode, block, data.as_ref()])?;
+        for block in (offset / bs + 1)..=((end - 1) / bs + 1) {
+            let chunk_start = (block - 1) * bs;
+            let s = offset.max(chunk_start) - chunk_start;
+            let e = end.min(chunk_start + bs) - chunk_start;
+            let src =
+                &data[(chunk_start + s - offset) as usize..(chunk_start + e - offset) as usize];
+            let stored: Option<(i64, u64)> = tx
+                .query_row(
+                    "SELECT rowid, length(data) FROM data WHERE file_id=$1 AND block_num=$2",
+                    params![inode, block as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match stored {
+                // Inside the stored bytes: patch them without rewriting the chunk.
+                Some((rowid, len)) if e <= len => {
+                    let mut blob =
+                        tx.blob_open(DatabaseName::Main, "data", "data", rowid, false)?;
+                    blob.write_at(src, s as usize)?;
+                }
+                // Grows the chunk: rewrite it (keep the old head only if not overwritten).
+                _ => {
+                    let old: Vec<u8> = if stored.is_some() && s > 0 {
+                        tx.query_row(
+                            "SELECT data FROM data WHERE file_id=$1 AND block_num=$2",
+                            params![inode, block as i64],
+                            |row| row.get(0),
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    tx.execute(
+                        "REPLACE INTO data (file_id, block_num, data) VALUES($1, $2, $3)",
+                        params![inode, block as i64, overlay(old, s as usize, src)],
+                    )?;
+                }
             }
         }
         tx.execute(
             "UPDATE metadata SET size=max(size, $1) WHERE id=$2",
-            params![size, inode],
+            params![end, inode],
         )?;
         let time = now_ns();
         update_mtime(inode, time, &tx)?;
@@ -768,7 +875,7 @@ impl DbModule for Sqlite {
     }
 
     fn get_db_block_size(&self) -> u32 {
-        BLOCK_SIZE
+        self.block_size
     }
 
     fn set_xattr(&mut self, inode: u32, key: &str, value: &[u8]) -> Result<()> {
@@ -836,5 +943,17 @@ impl DbModule for Sqlite {
         update_ctime(inode, time, &tx)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::overlay;
+
+    #[test]
+    fn partial_blocks_are_not_padded() {
+        assert_eq!(overlay(Vec::new(), 0, b"abc"), b"abc"); // new block: 3 bytes, not 4096
+        assert_eq!(overlay(b"0123456789".to_vec(), 2, b"xy"), b"01xy456789"); // keeps tail
+        assert_eq!(overlay(b"ab".to_vec(), 4, b"z"), b"ab\0\0z"); // gap is zero-filled
     }
 }

@@ -16,6 +16,8 @@ pub enum Error {
     FsFileExist { description: String },
     #[error("Invalid argument: {description}")]
     FsParm { description: String },
+    #[error("File too large: {description}")]
+    FsFileTooBig { description: String },
     #[error("Undefined error: {description}")]
     Undefined { description: String },
 }
@@ -38,6 +40,7 @@ impl Error {
             Error::FsNotEmpty { .. } => fuser::Errno::ENOTEMPTY,
             Error::FsFileExist { .. } => fuser::Errno::EEXIST,
             Error::FsParm { .. } => fuser::Errno::EPERM,
+            Error::FsFileTooBig { .. } => fuser::Errno::EFBIG,
             Error::Undefined { .. } => fuser::Errno::EIO,
         }
     }

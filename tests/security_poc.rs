@@ -62,8 +62,7 @@ fn create_symlink(db: &mut Sqlite, name: &str, target: &[u8]) -> u32 {
         .add_inode_and_dentry(1, name, &attr)
         .expect("create symlink");
     if !target.is_empty() {
-        db.write_data(ino, &[(1, target)], target.len() as u64)
-            .expect("write symlink data");
+        db.write_data(ino, 0, target).expect("write symlink data");
     }
     ino
 }
@@ -106,7 +105,7 @@ fn poc_v01_size_field_is_u32_cannot_hold_large_files() {
     let mut db = fresh_db();
     let ino = create_file(&mut db, "bigfile");
     let data = vec![0xAA; 4096];
-    db.write_data(ino, &[(1, &data)], 4096).unwrap();
+    db.write_data(ino, 0, &data).unwrap();
 
     let mut attr = db.get_inode(ino).unwrap().unwrap();
     attr.size = large_size; // u64 — no truncation
@@ -128,7 +127,7 @@ fn poc_v01_setattr_truncates_large_size_via_db() {
 
     // Write some data so the file exists
     let data = vec![0xAA; 4096];
-    db.write_data(ino, &[(1, &data)], 4096).unwrap();
+    db.write_data(ino, 0, &data).unwrap();
 
     // After the fix: DBFileAttr.size is u64, no truncation occurs
     let mut attr = db.get_inode(ino).unwrap().unwrap();
@@ -321,16 +320,15 @@ fn poc_v06_symlink_orphan_on_oversized_target() {
     let mut db = fresh_db();
 
     let oversized_target = vec![b'A'; 4097];
-    let block_size = db.get_db_block_size() as usize;
     assert!(
-        oversized_target.len() > block_size,
-        "target exceeds block size"
+        oversized_target.len() > 4096,
+        "target exceeds the 4096-byte symlink limit"
     );
 
     // After the fix: guard fires BEFORE add_inode_and_dentry —
     // if data.len() > 4096 { reply.error(ENAMETOOLONG); return; }
     // Simulate the fixed symlink() flow: only create inode when target fits.
-    if oversized_target.len() <= block_size {
+    if oversized_target.len() <= 4096 {
         let now = SystemTime::now();
         let attr = DBFileAttr {
             ino: 0,
@@ -406,26 +404,22 @@ fn poc_v08_lookup_block_count_wrong_without_group_by() {
     // Write 3 blocks to file_a
     for i in 1..=3 {
         let data = vec![0xAA; 4096];
-        db.write_data(ino_a, &[(i, &data)], i as u64 * 4096)
-            .unwrap();
+        db.write_data(ino_a, (i - 1) * 4096, &data).unwrap();
     }
 
     // Write 2 blocks to file_b
     for i in 1..=2 {
         let data = vec![0xBB; 4096];
-        db.write_data(ino_b, &[(i, &data)], i as u64 * 4096)
-            .unwrap();
+        db.write_data(ino_b, (i - 1) * 4096, &data).unwrap();
     }
 
-    // Now lookup file_a — the block count should be 3
+    // Now lookup file_a — 12 KiB of data is 24 st_blocks (512-byte units)
     let attr_a = db.lookup(1, "file_a").unwrap().unwrap();
 
-    // BUG: The subquery lacks GROUP BY, so it returns the total count (5)
-    // for an arbitrary file_id, or 0 if the join doesn't match.
+    // BUG (fixed): the subquery lacked GROUP BY and counted every file's blocks.
     assert_eq!(
-        attr_a.blocks, 3,
-        "V08: file_a has 3 data blocks but lookup reports {} — SQL subquery missing GROUP BY \
-         (total blocks in DB = 5)",
+        attr_a.blocks, 24,
+        "V08: file_a holds 12 KiB (24 x 512 B) but lookup reports {} — per-file count is wrong",
         attr_a.blocks
     );
 }
@@ -443,11 +437,11 @@ fn poc_v09_multi_block_write_is_one_transaction() {
 
     let data1 = vec![0x11; 4096];
     let data2 = vec![0x22; 4096];
-    db.write_data(ino, &[(1, &data1), (2, &data2)], 8192)
+    db.write_data(ino, 0, &[data1.as_slice(), &data2].concat())
         .unwrap();
 
-    assert_eq!(db.get_data(ino, 1, 4096).unwrap(), data1);
-    assert_eq!(db.get_data(ino, 2, 4096).unwrap(), data2);
+    assert_eq!(db.read_data(ino, 0, 4096).unwrap(), data1);
+    assert_eq!(db.read_data(ino, 4096, 4096).unwrap(), data2);
     assert_eq!(db.get_inode(ino).unwrap().unwrap().size, 8192);
 }
 
@@ -663,7 +657,7 @@ fn poc_v16_release_data_block_overflow_at_u32_edge() {
 
     // Write block 1
     let data = vec![0xFF; 4096];
-    db.write_data(ino, &[(1, &data)], 4096).unwrap();
+    db.write_data(ino, 0, &data).unwrap();
 
     // Truncate to 0 should delete all data
     let mut attr = db.get_inode(ino).unwrap().unwrap();
@@ -671,8 +665,8 @@ fn poc_v16_release_data_block_overflow_at_u32_edge() {
     db.update_inode(&attr, true).unwrap();
 
     // Verify data was deleted
-    let block = db.get_data(ino, 1, 4096).unwrap();
-    // get_data returns zero-filled vec when no data exists
+    let block = db.read_data(ino, 0, 4096).unwrap();
+    // read_data zero-fills ranges with no stored data
     assert!(
         block.iter().all(|&b| b == 0),
         "V16: truncate to 0 should remove all data blocks"
@@ -887,14 +881,14 @@ fn poc_v19_write_data_never_shrinks_size() {
 
     // Write 8192 bytes (blocks 1 and 2)
     let data = vec![0xAA; 4096];
-    db.write_data(ino, &[(1, &data)], 4096).unwrap();
-    db.write_data(ino, &[(2, &data)], 8192).unwrap();
+    db.write_data(ino, 0, &data).unwrap();
+    db.write_data(ino, 4096, &data).unwrap();
 
     let attr = db.get_inode(ino).unwrap().unwrap();
     assert_eq!(attr.size, 8192, "file should be 8192 bytes");
 
     // Now overwrite block 1 with size=4096 (a smaller total)
-    db.write_data(ino, &[(1, &data)], 4096).unwrap();
+    db.write_data(ino, 0, &data).unwrap();
 
     // Size should still be 8192 because write_data only grows, never shrinks.
     let attr2 = db.get_inode(ino).unwrap().unwrap();
