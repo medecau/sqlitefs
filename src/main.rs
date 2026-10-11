@@ -1,4 +1,4 @@
-use clap::{command, crate_version, Arg};
+use clap::{command, crate_version, Arg, ArgAction};
 use fuser::{Config, MountOption};
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::DbModule;
@@ -10,9 +10,9 @@ fn main() {
     let mount_option_arg = Arg::new("mount_option")
         .short('o')
         .long("option")
-        .help("Additional mount option for this filesystem")
+        .help("Additional mount option for this filesystem (repeatable)")
         .value_parser(clap::builder::NonEmptyStringValueParser::new())
-        .num_args(1..);
+        .action(ArgAction::Append);
 
     let mount_point_arg = Arg::new("mount_point")
         .help("Target mountpoint path")
@@ -41,13 +41,25 @@ fn main() {
             mount_options.push(MountOption::CUSTOM(i.clone()));
         }
     }
+    let db_path = matches.get_one::<String>("db_path");
+    // macFUSE calls an unnamed volume "macFUSE Volume N (sqlitefs)": name it after
+    // the database file unless -o volname=... was given. Commas would split the option.
+    #[cfg(target_os = "macos")]
+    if !mount_options
+        .iter()
+        .any(|o| matches!(o, MountOption::CUSTOM(s) if s.starts_with("volname=")))
+    {
+        let name = db_path
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .map_or("sqlitefs".into(), |s| s.to_string_lossy().replace(',', "_"));
+        mount_options.push(MountOption::CUSTOM(format!("volname={name}")));
+    }
     let mut config = Config::default();
     config.mount_options = mount_options;
 
     let mountpoint = matches
         .get_one::<String>("mount_point")
         .expect("Mount point path is missing.");
-    let db_path = matches.get_one::<String>("db_path");
     let fs: SqliteFs = match db_path {
         Some(path) => match SqliteFs::new(path) {
             Ok(n) => n,

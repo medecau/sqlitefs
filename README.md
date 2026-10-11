@@ -18,6 +18,9 @@ $ sqlite-fs <mount_point> [<db_path>]
 
 If a database file doesn't exist, sqlite-fs create db file and tables.
 
+Pass mount options with `-o`, one per flag (`-o rdonly -o volname=Docs`). On macOS the volume is
+named after the database file (`sqlitefs` for an in-memory database) unless `-o volname=<name>` is given.
+
 If a database file name isn't specified, sqlite-fs use in-memory-db instead of a file.
 All data will be deleted when the filesystem is closed.
 
