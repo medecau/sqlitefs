@@ -6,7 +6,7 @@ sqlite-fs allows Linux and MacOS to mount a sqlite database file as a normal fil
 
 ## Requirements
 
-- Latest Rust Programming Language (≥ 1.75)
+- Rust 1.97 or newer (rusqlite 0.40 supports the stable release current when it was published)
 - libfuse3 (Linux) or macFUSE (macOS) is required by [fuser](https://github.com/cberner/fuser)
 
 ## Usage

@@ -3,7 +3,7 @@ use crate::sqerror::{Error, Result};
 use fuser::FileType;
 use log::{debug, warn};
 use rusqlite::types::ToSql;
-use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Statement};
+use rusqlite::{params, Connection, OptionalExtension, Statement, MAIN_DB};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -812,8 +812,7 @@ impl DbModule for Sqlite {
             match stored {
                 // Inside the stored bytes: patch them without rewriting the chunk.
                 Some((rowid, len)) if e <= len => {
-                    let mut blob =
-                        tx.blob_open(DatabaseName::Main, "data", "data", rowid, false)?;
+                    let mut blob = tx.blob_open(MAIN_DB, c"data", c"data", rowid, false)?;
                     blob.write_at(src, s as usize)?;
                 }
                 // New or growing chunk: SQLite builds head || zero gap || src. `||`
