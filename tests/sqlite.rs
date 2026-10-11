@@ -180,6 +180,23 @@ fn link_count_queries_use_the_child_index() {
     );
 }
 
+#[test]
+fn chunk_queries_use_the_intended_indexes() {
+    let (_dir, path, _db) = file_db();
+    let conn = Connection::open(&path).unwrap();
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+        rows.map(|r| r.unwrap()).collect::<Vec<_>>().join("; ")
+    };
+    // GC liveness check, run by the triggers for every dropped reference.
+    let gc = plan("SELECT 1 FROM data WHERE chunk_hash = x'00'");
+    assert!(gc.contains("data_chunk_hash"), "{gc}");
+    // dedup_data's scan stays within one file instead of every private row.
+    let own = plan("SELECT block_num FROM data WHERE file_id = 2 AND chunk_hash IS NULL");
+    assert!(own.contains("sqlite_autoindex_data_1"), "{own}");
+}
+
 /// File-backed fresh DB plus a raw connection for inspecting the stored chunks.
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf, sqlite::Sqlite) {
     let dir = tempfile::tempdir().unwrap();
@@ -192,7 +209,11 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf, sqlite::Sqlite) {
 fn chunk_lengths(path: &std::path::Path, ino: u32) -> Vec<i64> {
     let conn = Connection::open(path).unwrap();
     let mut stmt = conn
-        .prepare("SELECT length(data) FROM data WHERE file_id = ? ORDER BY block_num")
+        .prepare(
+            "SELECT length(coalesce(data.data, chunk.data)) \
+             FROM data LEFT JOIN chunk ON chunk.hash = data.chunk_hash \
+             WHERE file_id = ? ORDER BY block_num",
+        )
         .unwrap();
     stmt.query_map([ino], |r| r.get(0))
         .unwrap()
@@ -345,4 +366,184 @@ fn grown_chunks_keep_their_head_and_zero_fill_gaps() {
             .collect()
     };
     assert_eq!(types, vec!["blob"]);
+}
+
+fn count(path: &std::path::Path, sql: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+/// 150,000 bytes: two different full 64 KiB chunks and an 18,928-byte tail.
+fn pattern() -> Vec<u8> {
+    (0..150_000u32).map(|i| (i % 251) as u8).collect()
+}
+
+/// A file written in one request and closed (release shares its chunks).
+fn closed_file(db: &mut sqlite::Sqlite, name: &str, data: &[u8]) -> u32 {
+    let ino = db.add_inode_and_dentry(1, name, &file_attr()).unwrap();
+    db.write_data(ino, 0, data).unwrap();
+    db.dedup_data(ino).unwrap();
+    ino
+}
+
+#[test]
+fn identical_files_share_chunks_keyed_by_blake3() {
+    let (_dir, path, mut db) = file_db();
+    let data = pattern();
+    let a = closed_file(&mut db, "a", &data);
+    let b = closed_file(&mut db, "b", &data);
+    assert_eq!(db.read_data(a, 0, 150_000).unwrap(), data);
+    assert_eq!(db.read_data(b, 0, 150_000).unwrap(), data);
+    assert_eq!(chunk_lengths(&path, b), vec![65536, 65536, 18928]);
+    assert_eq!(count(&path, "SELECT count(*) FROM data"), 6);
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 3);
+    assert_eq!(
+        count(&path, "SELECT count(*) FROM data WHERE data IS NOT NULL"),
+        0,
+        "closing leaves no private copies"
+    );
+    let conn = Connection::open(&path).unwrap();
+    let mut stmt = conn.prepare("SELECT hash, data FROM chunk").unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap();
+    for row in rows {
+        let (hash, bytes) = row.unwrap();
+        assert_eq!(hash, blake3::hash(&bytes).as_bytes());
+    }
+}
+
+#[test]
+fn chunks_filled_by_small_writes_are_shared_before_close() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    let data = pattern();
+    for (i, piece) in data.chunks(4096).enumerate() {
+        db.write_data(ino, i as u64 * 4096, piece).unwrap();
+    }
+    assert_eq!(db.read_data(ino, 0, 150_000).unwrap(), data);
+    // Each full chunk is shared once its last piece lands; the tail waits for close.
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM data WHERE chunk_hash IS NOT NULL"
+        ),
+        2
+    );
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 2);
+}
+
+#[test]
+fn writes_to_shared_chunks_leave_other_files_unchanged() {
+    let (_dir, path, mut db) = file_db();
+    let data = pattern();
+    let a = closed_file(&mut db, "a", &data);
+    let b = closed_file(&mut db, "b", &data);
+    db.write_data(a, 10, b"patch").unwrap(); // inside a shared full chunk
+    db.write_data(a, 150_000, b"append").unwrap(); // grows the shared tail
+    let mut expected = data.clone();
+    expected[10..15].copy_from_slice(b"patch");
+    expected.extend_from_slice(b"append");
+    assert_eq!(db.read_data(a, 0, 150_006).unwrap(), expected);
+    assert_eq!(db.read_data(b, 0, 150_000).unwrap(), data);
+    db.dedup_data(a).unwrap();
+    assert_eq!(
+        count(&path, "SELECT count(*) FROM chunk"),
+        5,
+        "b keeps the 3 originals; a adds its changed head and tail"
+    );
+    assert_eq!(db.read_data(b, 0, 150_000).unwrap(), data);
+}
+
+#[test]
+fn truncating_a_shared_chunk_leaves_other_files_unchanged() {
+    let (_dir, _path, mut db) = file_db();
+    let data = pattern();
+    let a = closed_file(&mut db, "a", &data);
+    let b = closed_file(&mut db, "b", &data);
+    let mut attr = db.get_inode(a).unwrap().unwrap();
+    attr.size = 70_000; // cuts the shared second chunk
+    db.update_inode(&attr, true).unwrap();
+    attr.size = 150_000; // growing again exposes zeros, not the shared bytes
+    db.update_inode(&attr, false).unwrap();
+    let mut expected = data.clone();
+    expected[70_000..].fill(0);
+    assert_eq!(db.read_data(a, 0, 150_000).unwrap(), expected);
+    assert_eq!(db.read_data(b, 0, 150_000).unwrap(), data);
+}
+
+#[test]
+fn chunks_are_deleted_with_their_last_reference() {
+    let (_dir, path, mut db) = file_db();
+    let data = pattern();
+    let a = closed_file(&mut db, "a", &data);
+    let b = closed_file(&mut db, "b", &data);
+    db.write_data(a, 0, &[1u8; 65536]).unwrap(); // replaces a's whole first chunk
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 4);
+    db.delete_dentry(1, "a").unwrap();
+    db.delete_inode_if_noref(a).unwrap(); // cascades to a's data rows
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 3);
+    db.delete_dentry(1, "b").unwrap();
+    db.delete_inode_if_noref(b).unwrap();
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 0);
+}
+
+#[test]
+fn databases_from_before_dedup_are_upgraded_in_place() {
+    let (_dir, path, mut db) = file_db();
+    let ino = db.add_inode_and_dentry(1, "f", &file_attr()).unwrap();
+    db.unmount().unwrap();
+    drop(db);
+    // The data table as written by builds before chunk sharing.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER chunk_gc_delete; DROP TRIGGER chunk_gc_update;
+             DROP INDEX data_chunk_hash; DROP TABLE data; DROP TABLE chunk;
+             CREATE TABLE data(file_id int, block_num int, data blob,
+                 foreign key (file_id) references metadata(id) on delete cascade,
+                 primary key (file_id, block_num));
+             INSERT INTO data VALUES (2, 1, x'6f6c64');",
+        )
+        .unwrap();
+    let mut db = sqlite::Sqlite::new(&path).unwrap();
+    db.init().unwrap();
+    assert_eq!(db.read_data(ino, 0, 3).unwrap(), b"old");
+    db.dedup_data(ino).unwrap();
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 1);
+    assert_eq!(db.read_data(ino, 0, 3).unwrap(), b"old");
+}
+
+#[test]
+fn undo_dedup_script_restores_the_pre_dedup_layout() {
+    let (_dir, path, mut db) = file_db();
+    let data = pattern();
+    let a = closed_file(&mut db, "a", &data);
+    let b = closed_file(&mut db, "b", &data);
+    db.unmount().unwrap();
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("../scripts/undo-dedup.sql"))
+        .unwrap();
+    assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 0);
+    assert_eq!(
+        count(&path, "SELECT count(*) FROM data WHERE data IS NULL"),
+        0
+    );
+    // Builds before chunk sharing read only data.data.
+    for ino in [a, b] {
+        let mut stmt = conn
+            .prepare("SELECT data FROM data WHERE file_id = ? ORDER BY block_num")
+            .unwrap();
+        let bytes: Vec<u8> = stmt
+            .query_map([ino], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .flat_map(|r| r.unwrap())
+            .collect();
+        assert_eq!(bytes, data);
+    }
 }

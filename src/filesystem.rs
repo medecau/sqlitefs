@@ -845,9 +845,17 @@ impl Filesystem for SqliteFs {
         let fh = fh.0;
         let mut handler = self.open_file_handler.lock().unwrap();
         let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
-        handle_list.list.remove(&fh);
+        let stat = handle_list.list.remove(&fh);
         if handle_list.list.is_empty() {
             handler.remove(&ino);
+        }
+        drop(handler);
+        // Closing settles what was written: share the chunks still held privately
+        // (a short tail, overwritten chunks). Read-only handles wrote nothing.
+        if stat.is_some_and(|s| !s.readonly) {
+            if let Err(err) = self.db.lock().unwrap().dedup_data(ino) {
+                warn!("release dedup_data: {}", err);
+            }
         }
         reply.ok();
     }

@@ -5,7 +5,8 @@ use std::time::SystemTime;
 
 pub trait DbModule {
     /// Create tables (if not found), migrate legacy text timestamps to integer
-    /// nanoseconds, and add root directory (if not found)
+    /// nanoseconds, add chunk sharing to older `data` tables, and add root
+    /// directory (if not found)
     fn init(&mut self) -> Result<()>;
     /// Get metadata. If not found, return None
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
@@ -47,6 +48,10 @@ pub trait DbModule {
     /// end of the write if larger. Update mtime and ctime. Fails with EFBIG past
     /// the largest addressable size.
     fn write_data(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<()>;
+    /// Share every chunk of the inode that still holds its own bytes: store it
+    /// once per distinct content, keyed by its BLAKE3 hash. Run when a writable
+    /// handle is released; write_data shares chunks as they become full.
+    fn dedup_data(&mut self, inode: u32) -> Result<()>;
     /// Make all committed transactions durable (forces a WAL checkpoint).
     fn checkpoint(&self) -> Result<()>;
     /// Called on unmount: checkpoint the WAL and switch to journal_mode=DELETE,
