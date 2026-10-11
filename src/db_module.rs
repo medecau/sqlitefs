@@ -1,12 +1,13 @@
 pub mod sqlite;
 use crate::sqerror::Result;
 use fuser::{FileAttr, FileType, INodeNo};
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 pub trait DbModule {
     /// Create tables (if not found), migrate legacy text timestamps to integer
-    /// nanoseconds, add chunk sharing to older `data` tables, and add root
-    /// directory (if not found)
+    /// nanoseconds, add chunk sharing to older `data` tables and the compression
+    /// marker to older `chunk` tables, and add root directory (if not found)
     fn init(&mut self) -> Result<()>;
     /// Get metadata. If not found, return None
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
@@ -48,10 +49,13 @@ pub trait DbModule {
     /// end of the write if larger. Update mtime and ctime. Fails with EFBIG past
     /// the largest addressable size.
     fn write_data(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<()>;
-    /// Share every chunk of the inode that still holds its own bytes: store it
-    /// once per distinct content, keyed by its BLAKE3 hash. Run when a writable
-    /// handle is released; write_data shares chunks as they become full.
-    fn dedup_data(&mut self, inode: u32) -> Result<()>;
+    /// One step of background dedup, a single short transaction: look at the next
+    /// few hundred chunks after `after` in (file, chunk) order and share the first
+    /// that still holds its own bytes, unless its file is in `skip`. Returns where
+    /// the next step starts, or None once the pass reached the end. write_data
+    /// shares chunks as they become full; this catches the rest (databases from
+    /// before dedup, short tails, chunks overwritten in place).
+    fn dedup_step(&mut self, after: (u32, i64), skip: &HashSet<u32>) -> Result<Option<(u32, i64)>>;
     /// Make all committed transactions durable (forces a WAL checkpoint).
     fn checkpoint(&self) -> Result<()>;
     /// Called on unmount: checkpoint the WAL and switch to journal_mode=DELETE,

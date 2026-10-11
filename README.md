@@ -34,10 +34,12 @@ all three files. If the process is killed without unmounting, the `-wal` file st
 recovered on the next mount.
 Databases created by older versions are migrated to integer timestamps on first mount.
 File data is stored in 64 KiB chunks; databases created by older versions keep their 4 KiB chunks.
-Identical chunks are stored once, keyed by their BLAKE3 hash, so copies of a file take no extra space.
+Identical chunks are stored once, keyed by their BLAKE3 hash, so copies of a file take no extra space,
+and chunks that compress are stored zstd-compressed. Databases from older versions mount as they
+are; a background thread deduplicates and compresses their chunks while the filesystem is in use.
 Older versions of sqlite-fs fail with I/O errors on shared chunks: before mounting a database with
-one, unmount it and run `sqlite3 <db_path> < scripts/undo-dedup.sql`, which gives every file its own
-copy of its chunks again.
+one, unmount it and run `python3 scripts/undo-dedup.py <db_path>` (Python 3.14+), which gives every
+file its own uncompressed copy of its chunks again.
 
 ### Unmount a filesystem
 
@@ -69,7 +71,7 @@ Hello world!
 - [x] Copy/Move files
 - [x] Create Hard Link and Symbolic Link
 - [x] Read/Write extended attributes
-- [x] Store identical file chunks once (BLAKE3-keyed deduplication)
+- [x] Store identical file chunks once (BLAKE3-keyed deduplication) and compressed (zstd); older databases are converted in the background
 - [x] File lock operations (POSIX advisory locks; `F_SETLKW` returns `EAGAIN` — blocking locks unsupported in single-threaded FUSE)
 - [x] Strict error handling
 

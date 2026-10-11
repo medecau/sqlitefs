@@ -187,19 +187,29 @@ for _ in $(seq 1 50); do is_mounted "$DBMNT" && break; sleep 0.1; done
 is_mounted "$DBMNT" || { echo "FAIL: file-backed mount never became live"; exit 1; }
 echo kept > "$DBMNT/f"
 # A copy shares every chunk with its source: 200,000 bytes are 3 full 64 KiB
-# chunks and a 3,392-byte tail; release shares the tails too.
+# chunks and a 3,392-byte tail; background dedup shares the tails after close.
+# Random bytes are stored as is; t1's 4 distinct chunks of text compress.
 head -c 200000 /dev/urandom > "$DBMNT/r1"
 cp "$DBMNT/r1" "$DBMNT/r2"
+head -c 200000 < <(yes sqlitefs) > "$DBMNT/t1"
 check "copy reads back identical" "" "$(cmp "$DBMNT/r1" "$DBMNT/r2" 2>&1)"
+# chunk rows, data rows, data rows still holding their own bytes, compressed chunks
+chunk_counts() {
+    python3 -c 'import sqlite3, sys
+print(*sqlite3.connect(sys.argv[1]).execute(
+    "SELECT (SELECT count(*) FROM chunk), (SELECT count(*) FROM data),"
+    " (SELECT count(*) FROM data WHERE data IS NOT NULL),"
+    " (SELECT count(*) FROM chunk WHERE compressed)").fetchone())' "$DBDIR/fs.sqlite"
+}
+# Background dedup works on the live database: wait for it to settle.
+for _ in $(seq 1 100); do [[ "$(chunk_counts)" == "9 13 0 4" ]] && break; sleep 0.1; done
+check "dedup settles while mounted" "9 13 0 4" "$(chunk_counts)"
+check "compressed text reads back" "" "$(cmp "$DBMNT/t1" <(head -c 200000 < <(yes sqlitefs)) 2>&1)"
 unmount_fs "$DBMNT"
 wait "$DB_PID" || true
 check "unmount leaves one db file" "fs.sqlite" "$(ls -A "$DBDIR")"
 check "unmount leaves rollback journal" "1 1" "$(od -An -tu1 -j18 -N2 "$DBDIR/fs.sqlite" | xargs)"
-# chunk rows, data rows, data rows still holding their own bytes
-check "copy shares chunks" "5 9 0" "$(python3 -c 'import sqlite3, sys
-print(*sqlite3.connect(sys.argv[1]).execute(
-    "SELECT (SELECT count(*) FROM chunk), (SELECT count(*) FROM data),"
-    " (SELECT count(*) FROM data WHERE data IS NOT NULL)").fetchone())' "$DBDIR/fs.sqlite")"
+check "copy shares chunks" "9 13 0 4" "$(chunk_counts)"
 rm -rf "$DBDIR"
 
 # --- 4. Report ---

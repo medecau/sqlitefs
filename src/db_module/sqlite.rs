@@ -2,8 +2,10 @@ use crate::db_module::{DBFileAttr, DEntry, DbModule};
 use crate::sqerror::{Error, Result};
 use fuser::FileType;
 use log::{debug, warn};
-use rusqlite::types::ToSql;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::{ToSql, Value, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension, Statement, MAIN_DB};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,11 @@ const DB_IFSOCK: u32 = 0o0_140_000;
 /// existed keep 4096 (the size their chunks were written with).
 const NEW_DB_BLOCK_SIZE: u32 = 65536;
 const LEGACY_BLOCK_SIZE: u32 = 4096;
+
+/// zstd level for new shared chunks: the fastest regular level.
+const ZSTD_LEVEL: i32 = 1;
+/// Rows one background dedup step looks at; it shares at most one of them.
+const DEDUP_SCAN_ROWS: i64 = 256;
 
 /// Timestamps are stored as i64 nanoseconds since the Unix epoch. Times outside
 /// that range (before 1677 or after 2262) saturate instead of failing.
@@ -62,13 +69,16 @@ const MIGRATE_TEXT_TIMESTAMPS: &str = "
     ALTER TABLE metadata DROP COLUMN crtime;
     ALTER TABLE metadata DROP COLUMN crtime_nsec;";
 
-/// Shared chunks: one row per distinct content, keyed by its BLAKE3 hash and never
-/// modified. A data row either holds its own bytes in `data` (editable in place)
-/// or points at a chunk through `chunk_hash`. The triggers delete a chunk with the
-/// last data row pointing at it, including rows removed by FK cascades. The index
-/// is partial so `chunk_hash IS NULL` lookups stay on the primary key.
+/// Shared chunks: one row per distinct content, keyed by the BLAKE3 hash of its
+/// bytes and never modified. `compressed` = 1 marks `data` as zstd-compressed, 0 as
+/// the bytes themselves; `unchunk()` reads both. A data row either holds its own
+/// bytes in `data` (editable in place, never compressed) or points at a chunk
+/// through `chunk_hash`. The triggers delete a chunk with the last data row
+/// pointing at it, including rows removed by FK cascades. The index is partial so
+/// `chunk_hash IS NULL` lookups stay on the primary key.
 const CHUNK_SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS chunk(hash blob primary key not null, data blob not null);
+    CREATE TABLE IF NOT EXISTS chunk(hash blob primary key not null, data blob not null,
+        compressed integer not null default 0);
     CREATE INDEX IF NOT EXISTS data_chunk_hash ON data(chunk_hash) WHERE chunk_hash IS NOT NULL;
     CREATE TRIGGER IF NOT EXISTS chunk_gc_delete AFTER DELETE ON data
     WHEN old.chunk_hash IS NOT NULL BEGIN
@@ -134,14 +144,24 @@ fn release_data(inode: u32, offset: u64, bs: u32, tx: &Connection) -> Result<()>
 }
 
 /// Point chunk `block` of `inode` at the shared copy of `bytes`, storing it unless
-/// a chunk with the same BLAKE3 hash already exists.
+/// a chunk with the same BLAKE3 hash already exists. A new chunk is stored
+/// compressed if that is smaller, else as is.
 fn share_chunk(inode: u32, block: i64, bytes: &[u8], tx: &Connection) -> Result<()> {
     let hash = blake3::hash(bytes);
     let hash = hash.as_bytes().as_slice();
-    tx.execute(
-        "INSERT OR IGNORE INTO chunk (hash, data) VALUES (?1, ?2)",
-        params![hash, bytes],
-    )?;
+    let stored = tx
+        .query_row("SELECT 1 FROM chunk WHERE hash = ?1", [hash], |_| Ok(()))
+        .optional()?;
+    if stored.is_none() {
+        let packed = zstd::bulk::compress(bytes, ZSTD_LEVEL).map_err(|err| Error::Undefined {
+            description: format!("zstd: {err}"),
+        })?;
+        let compressed = packed.len() < bytes.len();
+        tx.execute(
+            "INSERT INTO chunk (hash, data, compressed) VALUES (?1, ?2, ?3)",
+            params![hash, if compressed { &packed } else { bytes }, compressed],
+        )?;
+    }
     tx.execute(
         "INSERT INTO data (file_id, block_num, chunk_hash) VALUES (?1, ?2, ?3) \
          ON CONFLICT (file_id, block_num) DO UPDATE SET data = NULL, chunk_hash = ?3",
@@ -164,12 +184,34 @@ fn share_stored_chunk(inode: u32, block: i64, tx: &Connection) -> Result<()> {
 /// changing it leaves other files alone (no-op if it holds its own bytes).
 fn unshare_chunk(inode: u32, block: i64, tx: &Connection) -> Result<()> {
     tx.execute(
-        "UPDATE data SET data = (SELECT chunk.data FROM chunk WHERE chunk.hash = data.chunk_hash), \
+        "UPDATE data SET data = (SELECT unchunk(chunk.data, chunk.compressed) FROM chunk \
+                                 WHERE chunk.hash = data.chunk_hash), \
              chunk_hash = NULL \
          WHERE file_id=?1 AND block_num=?2 AND chunk_hash IS NOT NULL",
         params![inode, block],
     )?;
     Ok(())
+}
+
+/// Register SQL `unchunk(data, compressed)` on `conn`: a chunk row's bytes,
+/// decompressed if `compressed`; NULL (no chunk) stays NULL. A compressed chunk
+/// larger than `block_size` once decompressed is an error, not an allocation.
+pub fn add_unchunk(conn: &Connection, block_size: u32) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "unchunk",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| match (ctx.get_raw(0), ctx.get::<Option<bool>>(1)?) {
+            (ValueRef::Blob(packed), Some(true)) => {
+                zstd::bulk::decompress(packed, block_size as usize)
+                    .map(Value::Blob)
+                    .map_err(|err| rusqlite::Error::UserFunctionError(err.into()))
+            }
+            (data, _) => {
+                Value::try_from(data).map_err(|err| rusqlite::Error::UserFunctionError(err.into()))
+            }
+        },
+    )
 }
 
 fn update_mtime(inode: u32, ns: i64, tx: &Connection) -> Result<()> {
@@ -463,6 +505,18 @@ impl DbModule for Sqlite {
                 )?;
             }
             self.conn.execute_batch(CHUNK_SCHEMA)?;
+            // Chunk tables from before compression: their chunks are stored as is.
+            let marked: u32 = self.conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('chunk') WHERE name = 'compressed'",
+                [],
+                |row| row.get(0),
+            )?;
+            if marked == 0 {
+                self.conn.execute(
+                    "ALTER TABLE chunk ADD COLUMN compressed integer not null default 0",
+                    [],
+                )?;
+            }
         }
         {
             let row_count: u32 =
@@ -507,6 +561,7 @@ impl DbModule for Sqlite {
                     })
                 }
             };
+            add_unchunk(&self.conn, self.block_size)?;
         }
         {
             let sql = "SELECT count(id) FROM metadata WHERE id=1";
@@ -834,11 +889,12 @@ impl DbModule for Sqlite {
         // Per stored chunk: where its bytes land in `out`, and the bytes themselves,
         // its own or the shared chunk's (substr past a short chunk's end yields
         // fewer or none). Holes stay zero.
-        // ponytail: SQLite loads each whole chunk before substr(); blob read_at if
-        // small random reads become hot.
+        // ponytail: SQLite loads (and decompresses) each whole chunk before substr();
+        // blob read_at / a decompressed-chunk cache if small random reads become hot.
         let mut stmt = self.conn.prepare_cached(
             "SELECT max((block_num - 1) * ?4 - ?2, 0), \
-                    substr(coalesce(data.data, chunk.data), max(?2 - (block_num - 1) * ?4, 0) + 1, \
+                    substr(coalesce(data.data, unchunk(chunk.data, chunk.compressed)), \
+                           max(?2 - (block_num - 1) * ?4, 0) + 1, \
                            ?3 - max(?2, (block_num - 1) * ?4)) \
              FROM data LEFT JOIN chunk ON chunk.hash = data.chunk_hash \
              WHERE file_id = ?1 AND block_num BETWEEN ?5 AND ?6",
@@ -882,8 +938,9 @@ impl DbModule for Sqlite {
                 share_chunk(inode, block as i64, src, &tx)?;
                 continue;
             }
-            // ponytail: copy-on-write copies the whole chunk on the first write to it,
-            // so small random overwrites of shared chunks cost a chunk copy each.
+            // ponytail: copy-on-write copies (and decompresses) the whole chunk on the
+            // first write to it, so small random overwrites of shared chunks cost a
+            // chunk copy each.
             unshare_chunk(inode, block as i64, &tx)?;
             let stored: Option<(i64, u64)> = tx
                 .query_row(
@@ -910,7 +967,8 @@ impl DbModule for Sqlite {
                         params![inode, block as i64, s as i64, src],
                     )?;
                     // It just became full: share it now. Overwrites inside a full
-                    // chunk (the arm above) stay private until the file is closed.
+                    // chunk (the arm above) stay private until background dedup
+                    // reaches them after the file is closed.
                     if e == bs {
                         share_stored_chunk(inode, block as i64, &tx)?;
                     }
@@ -928,21 +986,32 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
-    fn dedup_data(&mut self, inode: u32) -> Result<()> {
-        // ponytail: one transaction for all of the file's private chunks (a whole
-        // file from before dedup on its first release); batch if that stalls.
+    fn dedup_step(&mut self, after: (u32, i64), skip: &HashSet<u32>) -> Result<Option<(u32, i64)>> {
         let tx = self.conn.transaction()?;
-        let blocks: Vec<i64> = {
-            let mut stmt =
-                tx.prepare("SELECT block_num FROM data WHERE file_id=?1 AND chunk_hash IS NULL")?;
-            let rows = stmt.query_map(params![inode], |row| row.get(0))?;
+        let rows: Vec<(u32, i64, bool)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT file_id, block_num, chunk_hash IS NULL FROM data \
+                 WHERE (file_id, block_num) > (?1, ?2) ORDER BY file_id, block_num LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![after.0, after.1, DEDUP_SCAN_ROWS], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        for block in blocks {
-            share_stored_chunk(inode, block, &tx)?;
+        let own = rows
+            .iter()
+            .find(|(file, _, own)| *own && !skip.contains(file));
+        if let Some(&(file, block, _)) = own {
+            share_stored_chunk(file, block, &tx)?;
+            tx.commit()?;
+            return Ok(Some((file, block)));
         }
-        tx.commit()?;
-        Ok(())
+        // Nothing to share among these rows: go on after them, or stop at the end.
+        let full = rows.len() as i64 == DEDUP_SCAN_ROWS;
+        Ok(rows
+            .last()
+            .filter(|_| full)
+            .map(|&(file, block, _)| (file, block)))
     }
 
     fn checkpoint(&self) -> Result<()> {

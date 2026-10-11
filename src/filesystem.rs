@@ -30,13 +30,19 @@ use crate::db_module::{DBFileAttr, DEntry, DbModule};
 use crate::sqerror::Error;
 use log::{debug, warn};
 use nix::sys::statvfs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 const ONE_SEC: Duration = Duration::from_secs(1);
+/// Pause between background dedup steps, so requests get the database in between.
+const DEDUP_PAUSE: Duration = Duration::from_millis(1);
+/// Time between background dedup passes when no written file is closed.
+const DEDUP_IDLE: Duration = Duration::from_secs(60);
 
 #[allow(dead_code)]
 struct OpenFileStat {
@@ -93,11 +99,14 @@ struct PosixLock {
 }
 
 pub struct SqliteFs {
-    db: Mutex<Sqlite>,
+    db: Arc<Mutex<Sqlite>>,
     lookup_count: Arc<Mutex<HashMap<u32, u64>>>,
     open_file_handler: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
     open_dir_handler: Arc<Mutex<HashMap<u32, OpenDirHandler>>>,
     locks: Arc<Mutex<HashMap<u32, Vec<PosixLock>>>>,
+    /// Background dedup thread, started by init(), and its stop flag.
+    dedup: Option<thread::Thread>,
+    dedup_stop: Arc<AtomicBool>,
 }
 
 impl SqliteFs {
@@ -109,11 +118,13 @@ impl SqliteFs {
         let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
         let locks = Arc::new(Mutex::new(HashMap::<u32, Vec<PosixLock>>::new()));
         Ok(SqliteFs {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             lookup_count,
             open_file_handler,
             open_dir_handler,
             locks,
+            dedup: None,
+            dedup_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -123,12 +134,50 @@ impl SqliteFs {
         let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
         let locks = Arc::new(Mutex::new(HashMap::<u32, Vec<PosixLock>>::new()));
         Ok(SqliteFs {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             lookup_count,
             open_file_handler,
             open_dir_handler,
             locks,
+            dedup: None,
+            dedup_stop: Arc::new(AtomicBool::new(false)),
         })
+    }
+}
+
+/// Background dedup: walk the data table one short step at a time, sharing the
+/// chunks that still hold their own bytes. Files open for writing are passed over
+/// (they are still changing); closing one starts another pass. Ends once `stop`.
+// ponytail: fixed pause between steps, so a busy mount gives up some throughput
+// while a pass has work; wait for idle requests if that shows.
+fn dedup_worker(
+    db: Arc<Mutex<Sqlite>>,
+    files: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        let mut at = Some((0, 0));
+        while let Some(after) = at {
+            let writing: HashSet<u32> = files
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, h)| h.list.values().any(|s| !s.readonly))
+                .map(|(&ino, _)| ino)
+                .collect();
+            let mut db = db.lock().unwrap();
+            // Checked under the lock: destroy() sets it before its last writes.
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            at = db.dedup_step(after, &writing).unwrap_or_else(|err| {
+                warn!("dedup_step: {}", err);
+                None
+            });
+            drop(db);
+            thread::sleep(DEDUP_PAUSE);
+        }
+        thread::park_timeout(DEDUP_IDLE);
     }
 }
 
@@ -231,10 +280,27 @@ impl Filesystem for SqliteFs {
             Ok(n) => n,
             Err(err) => warn!("init: delete_all_noref_inode: {}", err),
         };
+        drop(db);
+        let (db, files, stop) = (
+            self.db.clone(),
+            self.open_file_handler.clone(),
+            self.dedup_stop.clone(),
+        );
+        match thread::Builder::new()
+            .name("dedup".to_string())
+            .spawn(move || dedup_worker(db, files, stop))
+        {
+            Ok(worker) => self.dedup = Some(worker.thread().clone()),
+            Err(err) => warn!("init: dedup worker: {}", err),
+        }
         Ok(())
     }
 
     fn destroy(&mut self) {
+        self.dedup_stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = &self.dedup {
+            worker.unpark();
+        }
         let lc_list = self.lookup_count.lock().unwrap();
         let mut db = self.db.lock().unwrap();
         for key in lc_list.keys() {
@@ -850,11 +916,12 @@ impl Filesystem for SqliteFs {
             handler.remove(&ino);
         }
         drop(handler);
-        // Closing settles what was written: share the chunks still held privately
-        // (a short tail, overwritten chunks). Read-only handles wrote nothing.
+        // Closing settles what was written: have background dedup share the chunks
+        // still held privately (a short tail, overwritten chunks). Read-only
+        // handles wrote nothing.
         if stat.is_some_and(|s| !s.readonly) {
-            if let Err(err) = self.db.lock().unwrap().dedup_data(ino) {
-                warn!("release dedup_data: {}", err);
+            if let Some(worker) = &self.dedup {
+                worker.unpark();
             }
         }
         reply.ok();

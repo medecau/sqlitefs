@@ -1,6 +1,7 @@
 use fuser::FileType;
 use rusqlite::Connection;
 use sqlite_fs::db_module::{sqlite, DBFileAttr, DbModule};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod helpers;
@@ -192,9 +193,16 @@ fn chunk_queries_use_the_intended_indexes() {
     // GC liveness check, run by the triggers for every dropped reference.
     let gc = plan("SELECT 1 FROM data WHERE chunk_hash = x'00'");
     assert!(gc.contains("data_chunk_hash"), "{gc}");
-    // dedup_data's scan stays within one file instead of every private row.
-    let own = plan("SELECT block_num FROM data WHERE file_id = 2 AND chunk_hash IS NULL");
-    assert!(own.contains("sqlite_autoindex_data_1"), "{own}");
+    // A dedup step seeks to where the last one stopped and reads on in key order.
+    let step = plan(
+        "SELECT file_id, block_num, chunk_hash IS NULL FROM data \
+         WHERE (file_id, block_num) > (2, 1) ORDER BY file_id, block_num LIMIT 256",
+    );
+    assert!(
+        step.contains("sqlite_autoindex_data_1 ((file_id,block_num)>(?,?))"),
+        "{step}"
+    );
+    assert!(!step.contains("TEMP B-TREE"), "{step}");
 }
 
 /// File-backed fresh DB plus a raw connection for inspecting the stored chunks.
@@ -206,11 +214,18 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf, sqlite::Sqlite) {
     (dir, path, db)
 }
 
-fn chunk_lengths(path: &std::path::Path, ino: u32) -> Vec<i64> {
+/// A connection to inspect the database with, `unchunk()` included.
+fn raw(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).unwrap();
+    sqlite::add_unchunk(&conn, 65536).unwrap();
+    conn
+}
+
+fn chunk_lengths(path: &std::path::Path, ino: u32) -> Vec<i64> {
+    let conn = raw(path);
     let mut stmt = conn
         .prepare(
-            "SELECT length(coalesce(data.data, chunk.data)) \
+            "SELECT length(coalesce(data.data, unchunk(chunk.data, chunk.compressed))) \
              FROM data LEFT JOIN chunk ON chunk.hash = data.chunk_hash \
              WHERE file_id = ? ORDER BY block_num",
         )
@@ -369,10 +384,7 @@ fn grown_chunks_keep_their_head_and_zero_fill_gaps() {
 }
 
 fn count(path: &std::path::Path, sql: &str) -> i64 {
-    Connection::open(path)
-        .unwrap()
-        .query_row(sql, [], |r| r.get(0))
-        .unwrap()
+    raw(path).query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
 /// 150,000 bytes: two different full 64 KiB chunks and an 18,928-byte tail.
@@ -380,11 +392,26 @@ fn pattern() -> Vec<u8> {
     (0..150_000u32).map(|i| (i % 251) as u8).collect()
 }
 
-/// A file written in one request and closed (release shares its chunks).
+/// `n` bytes that don't compress (BLAKE3 output).
+fn noise(n: usize) -> Vec<u8> {
+    let mut bytes = vec![0; n];
+    blake3::Hasher::new().finalize_xof().fill(&mut bytes);
+    bytes
+}
+
+/// Background dedup steps until the pass ends, as the worker runs them.
+fn dedup_all(db: &mut sqlite::Sqlite) {
+    let mut at = Some((0, 0));
+    while let Some(after) = at {
+        at = db.dedup_step(after, &HashSet::new()).unwrap();
+    }
+}
+
+/// A file written in one request, closed, and passed by background dedup.
 fn closed_file(db: &mut sqlite::Sqlite, name: &str, data: &[u8]) -> u32 {
     let ino = db.add_inode_and_dentry(1, name, &file_attr()).unwrap();
     db.write_data(ino, 0, data).unwrap();
-    db.dedup_data(ino).unwrap();
+    dedup_all(db);
     ino
 }
 
@@ -402,10 +429,12 @@ fn identical_files_share_chunks_keyed_by_blake3() {
     assert_eq!(
         count(&path, "SELECT count(*) FROM data WHERE data IS NOT NULL"),
         0,
-        "closing leaves no private copies"
+        "dedup leaves no private copies"
     );
-    let conn = Connection::open(&path).unwrap();
-    let mut stmt = conn.prepare("SELECT hash, data FROM chunk").unwrap();
+    let conn = raw(&path);
+    let mut stmt = conn
+        .prepare("SELECT hash, unchunk(data, compressed) FROM chunk")
+        .unwrap();
     let rows = stmt
         .query_map([], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -426,7 +455,8 @@ fn chunks_filled_by_small_writes_are_shared_before_close() {
         db.write_data(ino, i as u64 * 4096, piece).unwrap();
     }
     assert_eq!(db.read_data(ino, 0, 150_000).unwrap(), data);
-    // Each full chunk is shared once its last piece lands; the tail waits for close.
+    // Each full chunk is shared once its last piece lands; the tail waits for
+    // background dedup.
     assert_eq!(
         count(
             &path,
@@ -450,7 +480,7 @@ fn writes_to_shared_chunks_leave_other_files_unchanged() {
     expected.extend_from_slice(b"append");
     assert_eq!(db.read_data(a, 0, 150_006).unwrap(), expected);
     assert_eq!(db.read_data(b, 0, 150_000).unwrap(), data);
-    db.dedup_data(a).unwrap();
+    dedup_all(&mut db);
     assert_eq!(
         count(&path, "SELECT count(*) FROM chunk"),
         5,
@@ -513,20 +543,117 @@ fn databases_from_before_dedup_are_upgraded_in_place() {
     let mut db = sqlite::Sqlite::new(&path).unwrap();
     db.init().unwrap();
     assert_eq!(db.read_data(ino, 0, 3).unwrap(), b"old");
-    db.dedup_data(ino).unwrap();
+    dedup_all(&mut db);
     assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 1);
     assert_eq!(db.read_data(ino, 0, 3).unwrap(), b"old");
 }
 
 #[test]
-fn undo_dedup_script_restores_the_pre_dedup_layout() {
+fn compressible_chunks_are_stored_compressed_and_others_as_is() {
     let (_dir, path, mut db) = file_db();
-    let data = pattern();
-    let a = closed_file(&mut db, "a", &data);
-    let b = closed_file(&mut db, "b", &data);
+    let (text, noise) = (pattern(), noise(150_000));
+    let a = closed_file(&mut db, "a", &text);
+    let b = closed_file(&mut db, "b", &noise);
+    assert_eq!(db.read_data(a, 0, 150_000).unwrap(), text);
+    assert_eq!(db.read_data(b, 0, 150_000).unwrap(), noise);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM chunk WHERE compressed \
+             AND length(data) < length(unchunk(data, compressed))"
+        ),
+        3
+    );
+    assert_eq!(
+        count(&path, "SELECT count(*) FROM chunk WHERE NOT compressed"),
+        3
+    );
+    // Changing a compressed shared chunk copies it back out decompressed.
+    db.write_data(a, 10, b"patch").unwrap();
+    assert_eq!(
+        db.read_data(a, 8, 9).unwrap(),
+        [&text[8..10], b"patch", &text[15..17]].concat()
+    );
+}
+
+#[test]
+fn chunk_tables_from_before_compression_stay_readable() {
+    let (_dir, path, mut db) = file_db();
+    let old = noise(150_000); // stored as is, like every chunk in such tables
+    let ino = closed_file(&mut db, "old", &old);
     db.unmount().unwrap();
     drop(db);
-    let conn = Connection::open(&path).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE chunk DROP COLUMN compressed")
+        .unwrap();
+    let mut db = sqlite::Sqlite::new(&path).unwrap();
+    db.init().unwrap();
+    assert_eq!(db.read_data(ino, 0, 150_000).unwrap(), old);
+    let new = closed_file(&mut db, "new", &pattern());
+    assert_eq!(db.read_data(new, 0, 150_000).unwrap(), pattern());
+    assert_eq!(
+        count(&path, "SELECT count(*) FROM chunk WHERE compressed"),
+        3
+    );
+}
+
+#[test]
+fn dedup_steps_share_one_chunk_each_and_pass_over_files_being_written() {
+    let (_dir, path, mut db) = file_db();
+    let names = ["a", "b", "c"];
+    let files: Vec<u32> = names
+        .iter()
+        .map(|name| {
+            let ino = db.add_inode_and_dentry(1, name, &file_attr()).unwrap();
+            db.write_data(ino, 0, name.as_bytes()).unwrap(); // a private short chunk
+            ino
+        })
+        .collect();
+    let own = || count(&path, "SELECT count(*) FROM data WHERE chunk_hash IS NULL");
+    let writing = HashSet::from([files[1]]);
+    assert_eq!(
+        db.dedup_step((0, 0), &writing).unwrap(),
+        Some((files[0], 1))
+    );
+    assert_eq!(own(), 2);
+    assert_eq!(
+        db.dedup_step((files[0], 1), &writing).unwrap(),
+        Some((files[2], 1))
+    );
+    assert_eq!(db.dedup_step((files[2], 1), &writing).unwrap(), None);
+    assert_eq!(own(), 1, "b is still open for writing");
+    dedup_all(&mut db);
+    assert_eq!(own(), 0);
+    for (ino, name) in files.iter().zip(names) {
+        assert_eq!(db.read_data(*ino, 0, 1).unwrap(), name.as_bytes());
+    }
+}
+
+#[test]
+fn a_dedup_step_looks_at_a_bounded_number_of_chunks() {
+    let mut db = fresh_db();
+    let ino = db.add_inode_and_dentry(1, "sparse", &file_attr()).unwrap();
+    for i in 0..300 {
+        db.write_data(ino, i * 65536, b"x").unwrap(); // 300 private chunks
+    }
+    let skip = HashSet::from([ino]);
+    // 256 rows looked at (DEDUP_SCAN_ROWS), none to share: the pass goes on after
+    // them, then ends on the last 44.
+    assert_eq!(db.dedup_step((0, 0), &skip).unwrap(), Some((ino, 256)));
+    assert_eq!(db.dedup_step((ino, 256), &skip).unwrap(), None);
+}
+
+#[test]
+fn undo_dedup_script_restores_the_pre_dedup_layout() {
+    let (_dir, path, mut db) = file_db();
+    let (text, noise) = (pattern(), noise(150_000)); // compressed and stored as is
+    let a = closed_file(&mut db, "a", &text);
+    let b = closed_file(&mut db, "b", &noise);
+    db.unmount().unwrap();
+    drop(db);
+    // undo-dedup.py provides unchunk() the same way.
+    let conn = raw(&path);
     conn.execute_batch(include_str!("../scripts/undo-dedup.sql"))
         .unwrap();
     assert_eq!(count(&path, "SELECT count(*) FROM chunk"), 0);
@@ -535,7 +662,7 @@ fn undo_dedup_script_restores_the_pre_dedup_layout() {
         0
     );
     // Builds before chunk sharing read only data.data.
-    for ino in [a, b] {
+    for (ino, data) in [(a, text), (b, noise)] {
         let mut stmt = conn
             .prepare("SELECT data FROM data WHERE file_id = ? ORDER BY block_num")
             .unwrap();
