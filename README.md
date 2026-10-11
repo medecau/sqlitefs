@@ -40,6 +40,9 @@ are; a background thread deduplicates and compresses their chunks while the file
 Older versions of sqlite-fs fail with I/O errors on shared chunks: before mounting a database with
 one, unmount it and run `python3 scripts/undo-dedup.py <db_path>` (Python 3.14+), which gives every
 file its own uncompressed copy of its chunks again.
+Space freed by deleting files is given back to the disk gradually, in the background. Databases
+created before this feature only reuse their free space; to let one shrink too, run once, while
+unmounted, `sqlite3 <db_path> 'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'` (it rewrites the whole file).
 
 ### Unmount a filesystem
 
@@ -72,6 +75,7 @@ Hello world!
 - [x] Create Hard Link and Symbolic Link
 - [x] Read/Write extended attributes
 - [x] Store identical file chunks once (BLAKE3-keyed deduplication) and compressed (zstd); older databases are converted in the background
+- [x] Give space freed by deleted files back to the disk gradually (incremental auto-vacuum)
 - [x] File lock operations (POSIX advisory locks; `F_SETLKW` returns `EAGAIN` — blocking locks unsupported in single-threaded FUSE)
 - [x] Strict error handling
 

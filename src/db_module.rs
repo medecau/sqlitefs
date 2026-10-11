@@ -56,6 +56,12 @@ pub trait DbModule {
     /// shares chunks as they become full; this catches the rest (databases from
     /// before dedup, short tails, chunks overwritten in place).
     fn dedup_step(&mut self, after: (u32, i64), skip: &HashSet<u32>) -> Result<Option<(u32, i64)>>;
+    /// One step of background vacuum, a single short transaction: move up to a
+    /// few hundred pages from the end of the file into free pages and cut the file
+    /// shorter (it shrinks on disk at the next checkpoint). Returns true while free
+    /// pages remain; false at once on databases created before incremental
+    /// auto-vacuum, which only reuse their free pages.
+    fn vacuum_step(&mut self) -> Result<bool>;
     /// Make all committed transactions durable (forces a WAL checkpoint).
     fn checkpoint(&self) -> Result<()>;
     /// Called on unmount: checkpoint the WAL and switch to journal_mode=DELETE,

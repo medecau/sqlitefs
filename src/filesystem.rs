@@ -39,10 +39,10 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 const ONE_SEC: Duration = Duration::from_secs(1);
-/// Pause between background dedup steps, so requests get the database in between.
-const DEDUP_PAUSE: Duration = Duration::from_millis(1);
-/// Time between background dedup passes when no written file is closed.
-const DEDUP_IDLE: Duration = Duration::from_secs(60);
+/// Pause between background steps, so requests get the database in between.
+const STEP_PAUSE: Duration = Duration::from_millis(1);
+/// Time between background passes when no written file is closed.
+const PASS_INTERVAL: Duration = Duration::from_secs(60);
 
 #[allow(dead_code)]
 struct OpenFileStat {
@@ -104,9 +104,9 @@ pub struct SqliteFs {
     open_file_handler: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
     open_dir_handler: Arc<Mutex<HashMap<u32, OpenDirHandler>>>,
     locks: Arc<Mutex<HashMap<u32, Vec<PosixLock>>>>,
-    /// Background dedup thread, started by init(), and its stop flag.
-    dedup: Option<thread::Thread>,
-    dedup_stop: Arc<AtomicBool>,
+    /// Background dedup and vacuum thread, started by init(), and its stop flag.
+    worker: Option<thread::Thread>,
+    worker_stop: Arc<AtomicBool>,
 }
 
 impl SqliteFs {
@@ -123,8 +123,8 @@ impl SqliteFs {
             open_file_handler,
             open_dir_handler,
             locks,
-            dedup: None,
-            dedup_stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            worker_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -139,22 +139,24 @@ impl SqliteFs {
             open_file_handler,
             open_dir_handler,
             locks,
-            dedup: None,
-            dedup_stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            worker_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 }
 
-/// Background dedup: walk the data table one short step at a time, sharing the
-/// chunks that still hold their own bytes. Files open for writing are passed over
-/// (they are still changing); closing one starts another pass. Ends once `stop`.
+/// Background work, in passes: first dedup, walking the data table one short
+/// step at a time and sharing the chunks that still hold their own bytes (files
+/// open for writing are passed over: they are still changing); then vacuum, giving
+/// free pages back to the file system a few hundred at a time. Closing a written
+/// file starts another pass. Ends once `stop` is set.
 // ponytail: fixed pause between steps, so a busy mount gives up some throughput
 // while a pass has work; wait for idle requests if that shows.
-fn dedup_worker(
+fn background_worker(
     db: Arc<Mutex<Sqlite>>,
     files: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
     stop: Arc<AtomicBool>,
-) {
+) -> Option<()> {
     loop {
         let mut at = Some((0, 0));
         while let Some(after) = at {
@@ -165,20 +167,40 @@ fn dedup_worker(
                 .filter(|(_, h)| h.list.values().any(|s| !s.readonly))
                 .map(|(&ino, _)| ino)
                 .collect();
-            let mut db = db.lock().unwrap();
-            // Checked under the lock: destroy() sets it before its last writes.
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            at = db.dedup_step(after, &writing).unwrap_or_else(|err| {
-                warn!("dedup_step: {}", err);
-                None
-            });
-            drop(db);
-            thread::sleep(DEDUP_PAUSE);
+            at = step(&db, &stop, |db| {
+                db.dedup_step(after, &writing).unwrap_or_else(|err| {
+                    warn!("dedup_step: {}", err);
+                    None
+                })
+            })?;
         }
-        thread::park_timeout(DEDUP_IDLE);
+        let vacuum = |db: &mut Sqlite| {
+            db.vacuum_step().unwrap_or_else(|err| {
+                warn!("vacuum_step: {}", err);
+                false
+            })
+        };
+        while step(&db, &stop, vacuum)? {}
+        thread::park_timeout(PASS_INTERVAL);
     }
+}
+
+/// Run `work` under the DB lock, then pause so requests get the lock in between.
+/// None once destroy() has stopped the worker.
+fn step<T>(
+    db: &Mutex<Sqlite>,
+    stop: &AtomicBool,
+    work: impl FnOnce(&mut Sqlite) -> T,
+) -> Option<T> {
+    let mut db = db.lock().unwrap();
+    // Checked under the lock: destroy() sets it before its last writes.
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let done = work(&mut db);
+    drop(db);
+    thread::sleep(STEP_PAUSE);
+    Some(done)
 }
 
 fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
@@ -284,21 +306,21 @@ impl Filesystem for SqliteFs {
         let (db, files, stop) = (
             self.db.clone(),
             self.open_file_handler.clone(),
-            self.dedup_stop.clone(),
+            self.worker_stop.clone(),
         );
         match thread::Builder::new()
-            .name("dedup".to_string())
-            .spawn(move || dedup_worker(db, files, stop))
+            .name("background".to_string())
+            .spawn(move || background_worker(db, files, stop))
         {
-            Ok(worker) => self.dedup = Some(worker.thread().clone()),
-            Err(err) => warn!("init: dedup worker: {}", err),
+            Ok(worker) => self.worker = Some(worker.thread().clone()),
+            Err(err) => warn!("init: background worker: {}", err),
         }
         Ok(())
     }
 
     fn destroy(&mut self) {
-        self.dedup_stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = &self.dedup {
+        self.worker_stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = &self.worker {
             worker.unpark();
         }
         let lc_list = self.lookup_count.lock().unwrap();
@@ -920,7 +942,7 @@ impl Filesystem for SqliteFs {
         // still held privately (a short tail, overwritten chunks). Read-only
         // handles wrote nothing.
         if stat.is_some_and(|s| !s.readonly) {
-            if let Some(worker) = &self.dedup {
+            if let Some(worker) = &self.worker {
                 worker.unpark();
             }
         }

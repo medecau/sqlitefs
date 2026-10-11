@@ -674,3 +674,48 @@ fn undo_dedup_script_restores_the_pre_dedup_layout() {
         assert_eq!(bytes, data);
     }
 }
+
+#[test]
+fn new_databases_give_freed_pages_back_in_steps() {
+    let (_dir, path, mut db) = file_db();
+    assert_eq!(count(&path, "PRAGMA auto_vacuum"), 2, "incremental");
+    let ino = closed_file(&mut db, "big", &noise(4 << 20));
+    db.checkpoint().unwrap();
+    let full = std::fs::metadata(&path).unwrap().len();
+    db.delete_dentry(1, "big").unwrap();
+    db.delete_inode_if_noref(ino).unwrap();
+    let free = || count(&path, "PRAGMA freelist_count");
+    let before = free();
+    assert!(
+        db.vacuum_step().unwrap(),
+        "more than one step's worth is free"
+    );
+    assert_eq!(before - free(), 256, "one step gives back 256 pages");
+    while db.vacuum_step().unwrap() {}
+    assert_eq!(free(), 0);
+    db.checkpoint().unwrap();
+    let left = std::fs::metadata(&path).unwrap().len();
+    assert!(left < full / 4, "{left} of {full} bytes left");
+}
+
+#[test]
+fn databases_from_before_auto_vacuum_only_reuse_free_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.sqlite");
+    // The file already exists, so auto_vacuum can no longer be switched on.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE x(a)")
+        .unwrap();
+    let mut db = sqlite::Sqlite::new(&path).unwrap();
+    db.init().unwrap();
+    let ino = closed_file(&mut db, "f", &noise(1 << 20));
+    db.delete_dentry(1, "f").unwrap();
+    db.delete_inode_if_noref(ino).unwrap();
+    assert_eq!(count(&path, "PRAGMA auto_vacuum"), 0);
+    assert!(count(&path, "PRAGMA freelist_count") > 0);
+    assert!(
+        !db.vacuum_step().unwrap(),
+        "nothing to do, not an endless loop"
+    );
+}

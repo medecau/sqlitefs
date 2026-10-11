@@ -204,12 +204,25 @@ print(*sqlite3.connect(sys.argv[1]).execute(
 # Background dedup works on the live database: wait for it to settle.
 for _ in $(seq 1 100); do [[ "$(chunk_counts)" == "9 13 0 4" ]] && break; sleep 0.1; done
 check "dedup settles while mounted" "9 13 0 4" "$(chunk_counts)"
+# Deleted content goes back to the file system: rm frees pages (once its chunks
+# are gone), and the next background pass, started by closing a written file,
+# vacuums them.
+head -c 2000000 /dev/urandom > "$DBMNT/big"
+rm "$DBMNT/big"
+for _ in $(seq 1 100); do [[ "$(chunk_counts)" == "9 13 0 4" ]] && break; sleep 0.1; done
+echo poke > "$DBMNT/poke"
+free_pages() {
+    python3 -c 'import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("PRAGMA freelist_count").fetchone()[0])' "$DBDIR/fs.sqlite"
+}
+for _ in $(seq 1 100); do [[ "$(free_pages)" == 0 ]] && break; sleep 0.1; done
+check "vacuum gives freed pages back" "0" "$(free_pages)"
 check "compressed text reads back" "" "$(cmp "$DBMNT/t1" <(head -c 200000 < <(yes sqlitefs)) 2>&1)"
 unmount_fs "$DBMNT"
 wait "$DB_PID" || true
 check "unmount leaves one db file" "fs.sqlite" "$(ls -A "$DBDIR")"
 check "unmount leaves rollback journal" "1 1" "$(od -An -tu1 -j18 -N2 "$DBDIR/fs.sqlite" | xargs)"
-check "copy shares chunks" "9 13 0 4" "$(chunk_counts)"
+check "copy shares chunks" "10 14 0 4" "$(chunk_counts)"  # + poke
 rm -rf "$DBDIR"
 
 # --- 4. Report ---

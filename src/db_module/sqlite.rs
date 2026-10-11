@@ -26,6 +26,8 @@ const LEGACY_BLOCK_SIZE: u32 = 4096;
 const ZSTD_LEVEL: i32 = 1;
 /// Rows one background dedup step looks at; it shares at most one of them.
 const DEDUP_SCAN_ROWS: i64 = 256;
+/// Free pages one background vacuum step gives back to the file system.
+const VACUUM_STEP_PAGES: i64 = 256;
 
 /// Timestamps are stored as i64 nanoseconds since the Unix epoch. Times outside
 /// that range (before 1677 or after 2262) saturate instead of failing.
@@ -385,11 +387,14 @@ pub struct Sqlite {
 impl Sqlite {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // auto_vacuum only takes on a new, empty file, and only before WAL is
+        // switched on (that writes the header); existing databases keep theirs.
         // enable foreign key. Sqlite ignores foreign key by default.
         // WAL + synchronous=NORMAL: commits skip the fsync, which is deferred to
         // checkpoints; fsync()/fsyncdir() force one via DbModule::checkpoint.
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+            "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA foreign_keys=ON; \
+             PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
         )?;
         Ok(Sqlite {
             conn,
@@ -400,7 +405,7 @@ impl Sqlite {
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", [])?;
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA foreign_keys=ON")?;
         Ok(Sqlite {
             conn,
             block_size: NEW_DB_BLOCK_SIZE,
@@ -1012,6 +1017,30 @@ impl DbModule for Sqlite {
             .last()
             .filter(|_| full)
             .map(|&(file, block, _)| (file, block)))
+    }
+
+    fn vacuum_step(&mut self) -> Result<bool> {
+        // Databases created without incremental auto-vacuum can't do this: their
+        // free pages are only reused, never given back.
+        let mode: i64 = self
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if mode != 2 {
+            return Ok(false);
+        }
+        // It yields a row per page it frees and pauses at each: step to the end
+        // (execute_batch would stop after one page).
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("PRAGMA incremental_vacuum({VACUUM_STEP_PAGES})"))?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(stmt);
+        let free: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok(free > 0)
     }
 
     fn checkpoint(&self) -> Result<()> {
