@@ -80,3 +80,25 @@ jobs:
 
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  security:
+    name: security
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # RustSec advisories for every crate in Cargo.lock.
+      - name: cargo audit
+        run: cargo audit
+
+      # RustSec and GitHub's advisory database do not track SQLite's own CVEs
+      # against libsqlite3-sys; compare the bundled version with sqlite.org.
+      - name: Bundled SQLite vs sqlite.org CVE list
+        if: success() || failure()
+        run: python3 scripts/check-sqlite-cves.py

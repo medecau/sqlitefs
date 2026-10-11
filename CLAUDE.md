@@ -14,6 +14,11 @@ cargo test
 # Run a single test by name
 cargo test sqlite_init_db
 
+# Security checks (CI `security` job): RustSec advisories, then the bundled
+# SQLite against sqlite.org/cves.html (RustSec doesn't track SQLite's own CVEs)
+cargo audit
+python3 scripts/check-sqlite-cves.py [CVE-ID ...]   # listed IDs are ignored
+
 # Run with debug logging
 RUST_LOG=debug cargo run -- <mount_point> [<db_path>]
 
