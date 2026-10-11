@@ -5,7 +5,14 @@ use sqlite_fs::db_module::DbModule;
 use sqlite_fs::filesystem::SqliteFs;
 
 fn main() {
-    env_logger::init();
+    // warn by default: failed requests are logged at warn! with their cause.
+    // fuser stays at error: it warns on every call to an op we leave unimplemented
+    // (cp tries copy_file_range first) and after every external umount.
+    // Millisecond timestamps show stalls between requests under RUST_LOG=debug.
+    let filter = env_logger::Env::default().default_filter_or("warn,fuser=error");
+    env_logger::Builder::from_env(filter)
+        .format_timestamp_millis()
+        .init();
 
     let mount_option_arg = Arg::new("mount_option")
         .short('o')
@@ -54,6 +61,14 @@ fn main() {
             .map_or("sqlitefs".into(), |s| s.to_string_lossy().replace(',', "_"));
         mount_options.push(MountOption::CUSTOM(format!("volname={name}")));
     }
+    let volume = mount_options
+        .iter()
+        .find_map(|o| match o {
+            MountOption::CUSTOM(s) => s.strip_prefix("volname="),
+            _ => None,
+        })
+        .map(|v| format!(" as volume \"{v}\""))
+        .unwrap_or_default();
     let mut config = Config::default();
     config.mount_options = mount_options;
 
@@ -92,8 +107,31 @@ fn main() {
             }
         }
     };
-    if let Err(err) = fuser::mount2(fs, mountpoint, &config) {
-        eprintln!("Mount failed: {}", err);
-        std::process::exit(1);
+    // Mount and serve separately, so a session that ends after mounting is not
+    // reported as a mount failure, and a clean unmount is reported at all.
+    let session = match fuser::spawn_mount2(fs, mountpoint, &config) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!("Mount failed: {}", err);
+            std::process::exit(1);
+        }
+    };
+    let db = db_path.map_or("in-memory database", |p| p.as_str());
+    // SQLITEFS_COMMIT, if set at build time, tells copied binaries apart.
+    let build = option_env!("SQLITEFS_COMMIT").unwrap_or("");
+    eprintln!(
+        "sqlite-fs {}{}: mounted {} on {}{}",
+        crate_version!(),
+        build,
+        db,
+        mountpoint,
+        volume
+    );
+    match session.join() {
+        Ok(()) => eprintln!("sqlite-fs: {} unmounted", mountpoint),
+        Err(err) => {
+            eprintln!("sqlite-fs: {} stopped: {}", mountpoint, err);
+            std::process::exit(1);
+        }
     }
 }

@@ -1101,13 +1101,14 @@ impl Filesystem for SqliteFs {
         let db = self.db.lock().unwrap();
         let value = match db.get_xattr(ino, name) {
             Ok(n) => n,
+            // Expected: macOS probes com.apple.* attributes on every file.
+            Err(Error::FsNoEnt { .. }) => {
+                reply.error(Errno::NO_XATTR);
+                return;
+            }
             Err(err) => {
                 warn!("getxattr ino={} name={}: {}", ino, name, err);
-                let errno = match &err {
-                    Error::FsNoEnt { .. } => Errno::NO_XATTR,
-                    _ => err.to_errno(),
-                };
-                reply.error(errno);
+                reply.error(err.to_errno());
                 return;
             }
         };
@@ -1157,13 +1158,13 @@ impl Filesystem for SqliteFs {
         let mut db = self.db.lock().unwrap();
         match db.delete_xattr(ino, name) {
             Ok(n) => n,
+            Err(Error::FsNoEnt { .. }) => {
+                reply.error(Errno::NO_XATTR);
+                return;
+            }
             Err(err) => {
                 warn!("removexattr ino={} name={}: {}", ino, name, err);
-                let errno = match &err {
-                    Error::FsNoEnt { .. } => Errno::NO_XATTR,
-                    _ => err.to_errno(),
-                };
-                reply.error(errno);
+                reply.error(err.to_errno());
                 return;
             }
         };
