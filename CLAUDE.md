@@ -67,6 +67,7 @@ The DB itself is an `Arc<Mutex<Sqlite>>` shared with one background thread, `bac
 **Key design decisions:**
 - Inode deletion is deferred: an inode is only deleted when its `dentry` reference count drops to zero AND the kernel has issued `forget` (tracked via `lookup_count`). This correctly handles the POSIX case of deleting an open file.
 - `macOS` vs Linux: `readdir` has two `#[cfg]` implementations because the macOS FUSE API doesn't cache dentries at `opendir` time the same way.
+- Access: `main` sets fuser's `config.acl = SessionACL::RootAndOwner`. fuser's default (`Owner`) answers `EACCES`, before any handler runs and without logging, to every request from another uid, root included; on macOS that broke Finder (`open` failed with error 5, the volume missing from Finder) because system services run as root. `RootAndOwner` mounts with `allow_other` and still rejects other non-root users itself; `default_permissions` leaves file permission checks to the kernel.
 - Foreign keys are explicitly enabled on every connection (`PRAGMA foreign_keys=ON`) since SQLite disables them by default.
 - Timestamps are stored as integer nanoseconds since the epoch (`*_ns` columns), saturating outside 1677–2262. `init()` migrates databases that still have the old text + `*_nsec` columns in place.
 - `nlink` and `blocks` are computed with `count(*)` scalar subqueries (the `metadata.nlink` column is unused), so an unlinked-but-open inode reports `nlink` 0. `blocks` is st_blocks in 512-byte units: stored chunks x `block_size`, capped at the size rounded up to 512.

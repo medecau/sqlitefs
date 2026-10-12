@@ -31,7 +31,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfuse3-dev pkg-config fuse3 attr
-          # src/main.rs hardcodes allow_other; non-root users need this in fuse.conf
+          # src/main.rs mounts with SessionACL::RootAndOwner, which passes allow_other;
+          # non-root users need this in fuse.conf
           grep -qxF user_allow_other /etc/fuse.conf \
             || echo user_allow_other | sudo tee -a /etc/fuse.conf
 

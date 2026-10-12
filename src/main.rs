@@ -1,5 +1,5 @@
 use clap::{command, crate_version, Arg, ArgAction};
-use fuser::{Config, MountOption};
+use fuser::{Config, MountOption, SessionACL};
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::DbModule;
 use sqlite_fs::filesystem::SqliteFs;
@@ -41,7 +41,6 @@ fn main() {
     let mut mount_options = vec![
         MountOption::FSName("sqlitefs".to_string()),
         MountOption::DefaultPermissions,
-        MountOption::CUSTOM("allow_other".to_string()),
     ];
     if let Some(v) = matches.get_many::<String>("mount_option") {
         for i in v {
@@ -71,6 +70,11 @@ fn main() {
         .unwrap_or_default();
     let mut config = Config::default();
     config.mount_options = mount_options;
+    // Answer root as well as the owner: macOS system services (Finder's helpers,
+    // Spotlight, Disk Arbitration) run as root, and fuser's default rejects them
+    // with EACCES before any handler runs, so Finder can't open the volume.
+    // fuser mounts with allow_other for this and filters other users itself.
+    config.acl = SessionACL::RootAndOwner;
 
     let mountpoint = matches
         .get_one::<String>("mount_point")
